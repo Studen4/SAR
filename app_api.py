@@ -48,30 +48,34 @@ def check_authentication() -> bool:
 
     if not st.session_state.authenticated:
         auth_file = "users.json"
+        users_db = {}
 
-        default_users = {
-            "admin": {"password": "admin123", "role": "admin"},
-            "friend": {"password": "stalzone2026", "role": "user"}
-        }
+        # 1. Спочатку шукаємо локальний users.json (для розробки на комп'ютері)
+        if os.path.exists(auth_file):
+            try:
+                with open(auth_file, "r", encoding="utf-8") as f:
+                    raw_db = json.load(f)
 
-        if not os.path.exists(auth_file):
-            with open(auth_file, "w", encoding="utf-8") as f:
-                json.dump(default_users, f, indent=4)
+                for user, data in raw_db.items():
+                    if isinstance(data, dict):
+                        users_db[user] = data
+                    else:
+                        # Сумісність зі старим форматом
+                        role = "admin" if user in ["admin", "1111"] else "user"
+                        users_db[user] = {"password": str(data), "role": role}
+            except Exception as e:
+                st.error(f"Помилка зчитування users.json: {e}")
 
-        try:
-            with open(auth_file, "r", encoding="utf-8") as f:
-                raw_db = json.load(f)
+        # 2. Якщо файлу немає (на сервері Streamlit Cloud) — беремо з Secrets
+        elif "users" in st.secrets:
+            users_db = dict(st.secrets["users"])
 
-            users_db = {}
-            for user, data in raw_db.items():
-                if isinstance(data, dict):
-                    users_db[user] = data
-                else:
-                    # Старий формат для сумісності
-                    role = "admin" if user in ["admin", "1111"] else "user"
-                    users_db[user] = {"password": str(data), "role": role}
-        except Exception:
-            users_db = default_users
+        # 3. Резервний варіант (якщо немає ні файлу, ні secrets)
+        # Створюємо ТІЛЬКИ в пам'яті 1 гостьового користувача БЕЗ прав адміна
+        if not users_db:
+            users_db = {
+                "guest": {"password": "guestpassword123", "role": "user"}
+            }
 
         _, col_center, _ = st.columns([1, 1.2, 1])
         with col_center:
@@ -79,8 +83,11 @@ def check_authentication() -> bool:
                         unsafe_allow_html=True)
             username = st.text_input("Логін")
             password = st.text_input("Пароль", type="password")
-            if st.button("Увійти", type="primary", width='stretch'):
+
+            if st.button("Увійти", type="primary", use_container_width=True):
                 user_entry = users_db.get(username)
+
+                # Перевіряємо пароль (і з диска, і з secrets)
                 if user_entry and str(user_entry.get("password")) == str(password):
                     st.session_state.authenticated = True
                     st.session_state.username = username

@@ -1,5 +1,6 @@
 # Конфігурація та секрети
 api_config.py
+.streamlit/secrets.toml
 
 # База даних та локальний стан
 *.db
