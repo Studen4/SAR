@@ -35,19 +35,35 @@ KYIV_TZ = pytz.timezone("Europe/Kyiv")
 def check_authentication() -> bool:
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
+        st.session_state.username = ""
+        st.session_state.role = "user"
 
     if not st.session_state.authenticated:
         auth_file = "users.json"
 
+        default_users = {
+            "admin": {"password": "admin123", "role": "admin"},
+            "friend": {"password": "stalzone2026", "role": "user"}
+        }
+
         if not os.path.exists(auth_file):
             with open(auth_file, "w", encoding="utf-8") as f:
-                json.dump({"admin": "admin123", "friend": "stalzone2026"}, f, indent=4)
+                json.dump(default_users, f, indent=4)
 
         try:
             with open(auth_file, "r", encoding="utf-8") as f:
-                users_db = json.load(f)
+                raw_db = json.load(f)
+
+            users_db = {}
+            for user, data in raw_db.items():
+                if isinstance(data, dict):
+                    users_db[user] = data
+                else:
+                    # Старий формат для сумісності
+                    role = "admin" if user in ["admin", "1111"] else "user"
+                    users_db[user] = {"password": str(data), "role": role}
         except Exception:
-            users_db = {"admin": "admin123"}
+            users_db = default_users
 
         _, col_center, _ = st.columns([1, 1.2, 1])
         with col_center:
@@ -55,10 +71,12 @@ def check_authentication() -> bool:
                         unsafe_allow_html=True)
             username = st.text_input("Логін")
             password = st.text_input("Пароль", type="password")
-            if st.button("Увійти", type="primary", width="stretch"):
-                if username in users_db and users_db[username] == password:
+            if st.button("Увійти", type="primary", width='stretch'):
+                user_entry = users_db.get(username)
+                if user_entry and str(user_entry.get("password")) == str(password):
                     st.session_state.authenticated = True
                     st.session_state.username = username
+                    st.session_state.role = user_entry.get("role", "user")
                     st.success("Успішний вхід!")
                     time.sleep(0.5)
                     st.rerun()
@@ -237,7 +255,7 @@ class StalzoneApiClient:
 
 
 # ==========================================
-# 2. МЕНЕДЖЕР БД (SQLite)
+# 2. МЕНЕДЖЕР БД (SQLite з підтримкою Owner)
 # ==========================================
 class DatabaseManager:
     def __init__(self, db_path: str = "stalzone_stats.db"):
@@ -254,9 +272,20 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS player_groups (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     group_name TEXT UNIQUE NOT NULL,
-                    nicknames TEXT NOT NULL
+                    nicknames TEXT NOT NULL,
+                    owner TEXT DEFAULT 'admin'
                 )
             """)
+
+            # Безпечна міграція для старих версій БД
+            cursor.execute("PRAGMA table_info(player_groups)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if "owner" not in columns:
+                try:
+                    cursor.execute("ALTER TABLE player_groups ADD COLUMN owner TEXT DEFAULT 'admin'")
+                except sqlite3.OperationalError:
+                    pass  # Колонка вже була додана паралельним потоком
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS daily_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -279,20 +308,30 @@ class DatabaseManager:
             """)
             conn.commit()
 
-    def save_group(self, name: str, nicknames: list):
+    def save_group(self, name: str, nicknames: list, owner: str = "admin"):
         nicks_str = ",".join([n.strip() for n in nicknames if n.strip()])
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO player_groups (group_name, nicknames) VALUES (?, ?)
-                ON CONFLICT(group_name) DO UPDATE SET nicknames=excluded.nicknames
-            """, (name, nicks_str))
+                INSERT INTO player_groups (group_name, nicknames, owner) VALUES (?, ?, ?)
+                ON CONFLICT(group_name) DO UPDATE SET nicknames=excluded.nicknames, owner=excluded.owner
+            """, (name, nicks_str, owner))
             conn.commit()
 
-    def get_groups(self) -> dict:
+    def get_groups(self, owner: str = "admin") -> dict:
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT group_name, nicknames FROM player_groups")
+            if owner == "admin":
+                cursor.execute("SELECT group_name, nicknames FROM player_groups WHERE owner = 'admin' OR owner IS NULL")
+            else:
+                cursor.execute("SELECT group_name, nicknames FROM player_groups WHERE owner = ?", (owner,))
+            rows = cursor.fetchall()
+            return {row[0]: [n.strip() for n in row[1].split(",") if n.strip()] for row in rows}
+
+    def get_global_groups(self) -> dict:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT group_name, nicknames FROM player_groups WHERE owner = 'admin' OR owner IS NULL")
             rows = cursor.fetchall()
             return {row[0]: [n.strip() for n in row[1].split(",") if n.strip()] for row in rows}
 
@@ -392,7 +431,7 @@ class DatabaseManager:
 
 
 # ==========================================
-# 3. АВТОМАТИЧНИЙ ФОНОВИЙ ПЛАНУВАЛЬНИК (BACKGROUND SCHEDULER)
+# 3. АВТОМАТИЧНИЙ ФОНОВИЙ ПЛАНУВАЛЬНИК (ТІЛЬКИ ГЛОБАЛЬНІ БЛОКИ)
 # ==========================================
 def run_background_scheduler():
     logger.info("⏰ Фоновий автозбір даних за розкладом запущено!")
@@ -404,15 +443,13 @@ def run_background_scheduler():
             today_str = now_kyiv.strftime("%Y-%m-%d")
             hour = now_kyiv.hour
             minute = now_kyiv.minute
-            weekday = now_kyiv.weekday()  # 0: Mon, 1: Tue, 2: Wed, 3: Thu, 4: Fri, 5: Sat, 6: Sun
+            weekday = now_kyiv.weekday()
 
-            # Визначення часу завершення КВ:
-            # Нд(6), Пн(0), Вт(1), Ср(2) -> 22:00
-            # Чт(3), Пт(4), Сб(5) -> 22:15
             target_cw_hour, target_cw_min = (22, 0) if weekday in [6, 0, 1, 2] else (22, 15)
 
             db = DatabaseManager()
-            groups = db.get_groups()
+            # Тільки глобальні (кланові / адмін) блоки для автоматичного запису!
+            groups = db.get_global_groups()
             all_nicks = set()
             for group_nicks in groups.values():
                 all_nicks.update(group_nicks)
@@ -420,9 +457,9 @@ def run_background_scheduler():
             if all_nicks:
                 api_client = StalzoneApiClient(API_CLIENT_ID, API_CLIENT_SECRET, "EU")
 
-                # 1. Запит о 00:00 (Початок дня)
+                # 1. Запит о 00:00
                 if hour == 0 and minute == 0 and (today_str, "00:00") not in executed_tasks:
-                    logger.info("⏰ [SCHEDULE] Виконання автоматичного зрізу 00:00 для всіх блоків...")
+                    logger.info("⏰ [SCHEDULE] Виконання автоматичного зрізу 00:00 для глобальних блоків...")
                     for nick in all_nicks:
                         stats = api_client.fetch_player_stats(nick)
                         if stats.get("status") == "OK":
@@ -430,9 +467,9 @@ def run_background_scheduler():
                     executed_tasks[(today_str, "00:00")] = True
                     logger.info("✅ [SCHEDULE] Зріз 00:00 завершено.")
 
-                # 2. Запит о 21:00 (Початок КВ)
+                # 2. Запит о 21:00
                 if hour == 21 and minute == 0 and (today_str, "21:00") not in executed_tasks:
-                    logger.info("⏰ [SCHEDULE] Виконання автоматичного зрізу 21:00 для всіх блоків...")
+                    logger.info("⏰ [SCHEDULE] Виконання автоматичного зрізу 21:00 для глобальних блоків...")
                     for nick in all_nicks:
                         stats = api_client.fetch_player_stats(nick)
                         if stats.get("status") == "OK":
@@ -442,9 +479,9 @@ def run_background_scheduler():
                     executed_tasks[(today_str, "21:00")] = True
                     logger.info("✅ [SCHEDULE] Зріз 21:00 завершено.")
 
-                # 3. Запит після КВ (22:00 або 22:15)
+                # 3. Запит після КВ
                 if hour == target_cw_hour and minute == target_cw_min and (today_str, "CW_END") not in executed_tasks:
-                    logger.info(f"⏰ [SCHEDULE] Виконання автоматичного зрізу CW_END ({target_cw_hour}:{target_cw_min:02d}) для всіх блоків...")
+                    logger.info(f"⏰ [SCHEDULE] Виконання автоматичного зрізу CW_END ({target_cw_hour}:{target_cw_min:02d}) для глобальних блоків...")
                     for nick in all_nicks:
                         stats = api_client.fetch_player_stats(nick)
                         if stats.get("status") == "OK":
@@ -452,7 +489,6 @@ def run_background_scheduler():
                     executed_tasks[(today_str, "CW_END")] = True
                     logger.info("✅ [SCHEDULE] Зріз CW_END завершено.")
 
-            # Очищення застарілих міток
             cutoff = (now_kyiv - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
             for key in list(executed_tasks.keys()):
                 if key[0] < cutoff:
@@ -601,10 +637,15 @@ class AnalyticsEngine:
 # 5. STREAMLIT ІНТЕРФЕЙС
 # ==========================================
 def main():
-    st.set_page_config(page_title="Stalzone HQ Stats API", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title="SAR", layout="wide", initial_sidebar_state="expanded")
 
     if not check_authentication():
         return
+
+    # Перевірка ролі користувача
+    username = st.session_state.get("username", "admin")
+    user_role = st.session_state.get("role", "user")
+    is_admin = (user_role == "admin")
 
     # Запуск авто-планувальника
     start_scheduler()
@@ -663,8 +704,11 @@ def main():
 
     # --- БІЧНА ПАНЕЛЬ ---
     with st.sidebar:
-        st.write(f"👤 Користувач: **{st.session_state.get('username', 'Admin')}**")
-        if st.button("Вийти", width="stretch"):
+        role_label = "🛡️ Адміністратор / Клан" if is_admin else "👤 Персональний акаунт"
+        st.write(f"👤 Користувач: **{username}**")
+        st.caption(f"Тип профілю: **{role_label}**")
+
+        if st.button("Вийти", width='stretch'):
             st.session_state.authenticated = False
             st.rerun()
 
@@ -692,7 +736,7 @@ def main():
                 file_name=file_name,
                 mime="text/csv",
                 help="Зберегти поточний зріз у CSV",
-                width="stretch",
+                width='stretch',
                 disabled=not bool(st.session_state.live_stats)
             )
 
@@ -700,7 +744,7 @@ def main():
             btn_label = "🛑 Кінець" if is_tracking_active else "⏱️ Початок"
             btn_help = "Записати кінець екстренного зрізу" if is_tracking_active else "Записати початок екстренного зрізу"
 
-            if st.button(btn_label, help=btn_help, width="stretch"):
+            if st.button(btn_label, help=btn_help, width='stretch'):
                 if not st.session_state.live_stats:
                     st.warning("Спочатку отримайте дані через кнопку 'Отримати дані'!")
                 else:
@@ -709,155 +753,169 @@ def main():
                         db.clear_daily_data("CUSTOM_END")
                         for nick, stats in st.session_state.live_stats.items():
                             db.save_snapshot("CUSTOM_START", stats)
-                        st.success("⏱️ Початок екстренного зрізу зафіксовано в БД!")
+                        st.success("⏱️ Початок зрізу зафіксовано в БД!")
                     else:
                         db.clear_daily_data("CUSTOM_END")
                         for nick, stats in st.session_state.live_stats.items():
                             db.save_snapshot("CUSTOM_END", stats)
-                        st.success("✅ Кінець екстренного зрізу зафіксовано в БД!")
+                        st.success("✅ Кінець зрізу зафіксовано в БД!")
                     time.sleep(1.5)
                     st.rerun()
 
         st.divider()
         st.subheader("Управління блоками")
 
-        groups = db.get_groups()
+        # Для адміна завантажуються глобальні блоки, для юзера — тільки власні
+        groups = db.get_groups(owner="admin" if is_admin else username)
         group_names = list(groups.keys())
         selected_group = st.selectbox("Обрати блок для перегляду", options=["-- Не обрано --"] + group_names)
 
         active_nicks = groups.get(selected_group, []) if selected_group and selected_group != "-- Не обрано --" else []
 
         st.markdown("---")
-        with st.expander("🛠️ Тестові кнопки замірів (Debug)", expanded=False):
-            st.caption("Керування зрізами в БД для ручної перевірки обчислень.")
 
-            if st.button("🗑️ Скинути всі заміри", type="secondary", width="stretch"):
-                db.clear_daily_data()
-                st.session_state.live_stats = {}
-                st.session_state.custom_start = {}
-                st.session_state.custom_end = {}
-                st.success("🧹 Усі зрізи успішно видалено з БД!")
-                time.sleep(1)
-                st.rerun()
+        # 🛠️ ДЕБАГ-БЛОК ДЛЯ АДМІНІСТРАТОРІВ
+        if is_admin:
+            with st.expander("🛠️ Тестові кнопки замірів (Debug)", expanded=False):
+                st.caption("Керування зрізами в БД для ручної перевірки обчислень.")
 
-            has_custom_data = bool(st.session_state.custom_start or st.session_state.custom_end)
-            if st.button("🗑️⏱️ Видалити екстренний зріз", width="stretch", disabled=not has_custom_data):
-                db.clear_daily_data("CUSTOM_START")
-                db.clear_daily_data("CUSTOM_END")
-                st.session_state.custom_start = {}
-                st.session_state.custom_end = {}
-                st.warning("🗑️ Екстренний зріз видалено!")
-                time.sleep(1)
-                st.rerun()
-
-            st.divider()
-            st.caption("🧪 Запис картки гравця:")
-
-            col_hist1, col_hist2 = st.columns(2)
-            with col_hist1:
-                if st.button("📸 1 день тому", width="stretch", help="Зберегти поточні дані з датою -1 день"):
-                    if not st.session_state.live_stats:
-                        st.warning("Спочатку спарсіть/отримайте дані!")
-                    else:
-                        ts_1d = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
-                        for nick, stats in st.session_state.live_stats.items():
-                            db.save_snapshot("DAILY_TEST_1D", stats, custom_timestamp=ts_1d)
-                        st.success("✅ Записано тестовий зріз за 1 день тому!")
-
-            with col_hist2:
-                if st.button("📸 7 днів тому", width="stretch", help="Зберегти поточні дані з датою -7 днів"):
-                    if not st.session_state.live_stats:
-                        st.warning("Спочатку спарсіть/отримайте дані!")
-                    else:
-                        ts_7d = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-                        for nick, stats in st.session_state.live_stats.items():
-                            db.save_snapshot("DAILY_TEST_7D", stats, custom_timestamp=ts_7d)
-                        st.success("✅ Записано тестовий зріз за 7 днів тому!")
-
-            st.divider()
-
-            if st.button("📸 Записати 00:00", width="stretch"):
-                if not active_nicks:
-                    st.error("Оберіть блок гравців у списку вище!")
-                elif not st.session_state.live_stats:
-                    st.warning("Спочатку отримайте дані ('Отримати дані')!")
-                else:
-                    for nick in active_nicks:
-                        if nick in st.session_state.live_stats:
-                            db.save_snapshot("00:00", st.session_state.live_stats[nick])
-                    st.success("✅ Зріз 00:00 збережено!")
+                if st.button("🗑️ Скинути всі заміри", type="secondary", width='stretch'):
+                    db.clear_daily_data()
+                    st.session_state.live_stats = {}
+                    st.session_state.custom_start = {}
+                    st.session_state.custom_end = {}
+                    st.success("🧹 Усі зрізи успішно видалено з БД!")
                     time.sleep(1)
                     st.rerun()
 
-            if st.button("📸 Записати 21:00", width="stretch"):
-                if not active_nicks:
-                    st.error("Оберіть блок гравців у списку вище!")
-                elif not st.session_state.live_stats:
-                    st.warning("Спочатку отримайте дані ('Отримати дані')!")
-                else:
-                    for nick in active_nicks:
-                        if nick in st.session_state.live_stats:
-                            db.save_snapshot("21:00", st.session_state.live_stats[nick])
-
+                has_custom_data = bool(st.session_state.custom_start or st.session_state.custom_end)
+                if st.button("🗑️⏱️ Видалити екстренний зріз", width='stretch', disabled=not has_custom_data):
                     db.clear_daily_data("CUSTOM_START")
                     db.clear_daily_data("CUSTOM_END")
                     st.session_state.custom_start = {}
                     st.session_state.custom_end = {}
-                    st.success("✅ Зріз 21:00 збережено!")
+                    st.warning("🗑️ Екстренний зріз видалено!")
                     time.sleep(1)
                     st.rerun()
 
-            # 🔙 ПОВЕРНУТА КНОПКА ЗАПИСУ КІНЦЯ КВ
-            if st.button("📸 Записати кінець КВ (CW_END)", width="stretch"):
-                if not active_nicks:
-                    st.error("Оберіть блок гравців у списку вище!")
-                elif not st.session_state.live_stats:
-                    st.warning("Спочатку отримайте дані ('Отримати дані')!")
-                else:
-                    for nick in active_nicks:
-                        if nick in st.session_state.live_stats:
-                            db.save_snapshot("CW_END", st.session_state.live_stats[nick])
-                    st.success("✅ Зріз кінця КВ (CW_END) збережено!")
-                    time.sleep(1)
-                    st.rerun()
+                st.divider()
+                st.caption("🧪 Запис картки гравця:")
 
+                col_hist1, col_hist2 = st.columns(2)
+                with col_hist1:
+                    if st.button("📸 1 день тому", width='stretch', help="Зберегти поточні дані з датою -1 день"):
+                        if not st.session_state.live_stats:
+                            st.warning("Спочатку спарсіть/отримайте дані!")
+                        else:
+                            ts_1d = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+                            for nick, stats in st.session_state.live_stats.items():
+                                db.save_snapshot("DAILY_TEST_1D", stats, custom_timestamp=ts_1d)
+                            st.success("✅ Записано тестовий зріз за 1 день тому!")
+
+                with col_hist2:
+                    if st.button("📸 7 днів тому", width='stretch', help="Зберегти поточні дані з датою -7 днів"):
+                        if not st.session_state.live_stats:
+                            st.warning("Спочатку спарсіть/отримайте дані!")
+                        else:
+                            ts_7d = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+                            for nick, stats in st.session_state.live_stats.items():
+                                db.save_snapshot("DAILY_TEST_7D", stats, custom_timestamp=ts_7d)
+                            st.success("✅ Записано тестовий зріз за 7 днів тому!")
+
+                st.divider()
+
+                if st.button("📸 Записати 00:00", width='stretch'):
+                    if not active_nicks:
+                        st.error("Оберіть блок гравців у списку вище!")
+                    elif not st.session_state.live_stats:
+                        st.warning("Спочатку отримайте дані ('Отримати дані')!")
+                    else:
+                        for nick in active_nicks:
+                            if nick in st.session_state.live_stats:
+                                db.save_snapshot("00:00", st.session_state.live_stats[nick])
+                        st.success("✅ Зріз 00:00 збережено!")
+                        time.sleep(1)
+                        st.rerun()
+
+                if st.button("📸 Записати 21:00", width='stretch'):
+                    if not active_nicks:
+                        st.error("Оберіть блок гравців у списку вище!")
+                    elif not st.session_state.live_stats:
+                        st.warning("Спочатку отримайте дані ('Отримати дані')!")
+                    else:
+                        for nick in active_nicks:
+                            if nick in st.session_state.live_stats:
+                                db.save_snapshot("21:00", st.session_state.live_stats[nick])
+
+                        db.clear_daily_data("CUSTOM_START")
+                        db.clear_daily_data("CUSTOM_END")
+                        st.session_state.custom_start = {}
+                        st.session_state.custom_end = {}
+                        st.success("✅ Зріз 21:00 збережено!")
+                        time.sleep(1)
+                        st.rerun()
+
+                if st.button("📸 Записати кінець КВ (CW_END)", width='stretch'):
+                    if not active_nicks:
+                        st.error("Оберіть блок гравців у списку вище!")
+                    elif not st.session_state.live_stats:
+                        st.warning("Спочатку отримайте дані ('Отримати дані')!")
+                    else:
+                        for nick in active_nicks:
+                            if nick in st.session_state.live_stats:
+                                db.save_snapshot("CW_END", st.session_state.live_stats[nick])
+                        st.success("✅ Зріз кінця КВ (CW_END) збережено!")
+                        time.sleep(1)
+                        st.rerun()
+
+        # ➕ СТВОРЕННЯ ТА РЕДАГУВАННЯ БЛОКУ
         with st.expander("➕ Створити / Редагувати блок"):
-            new_group_name = st.text_input("Назва блоку (напр. Склад 1)")
+            new_group_name = st.text_input("Назва блоку (напр. Мій загін)")
             default_nicks = "\n".join(groups.get(new_group_name, [])) if new_group_name in groups else ""
             nicks_input = st.text_area("Нікнейми (по одному на рядок)", value=default_nicks, height=120)
 
-            if st.button("Зберегти блок", width="stretch"):
+            if st.button("Зберегти блок", width='stretch'):
                 if new_group_name and nicks_input:
                     nicks_list = [n.strip() for n in nicks_input.split("\n") if n.strip()]
-                    db.save_group(new_group_name, nicks_list)
+                    block_owner = "admin" if is_admin else username
+                    db.save_group(new_group_name, nicks_list, owner=block_owner)
                     st.success(f"Блок '{new_group_name}' збережено!")
                     st.rerun()
 
-            st.divider()
-            st.markdown("**🛡️ Отримати блок з Клану**")
-            clan_nick_search = st.text_input("Нікнейм гравця клану")
-            if st.button("📥 Завантажити склад клану", width="stretch"):
-                if clan_nick_search:
-                    api_client = StalzoneApiClient(API_CLIENT_ID, API_CLIENT_SECRET, region)
-                    with st.spinner(f"Запит клану для {clan_nick_search}..."):
-                        c_name, c_members = api_client.fetch_clan_members_by_player(clan_nick_search)
-                        if c_name and c_members:
-                            db.save_group(c_name, c_members)
-                            st.success(f"✅ Клан '{c_name}' додано! Отримано {len(c_members)} гравців.")
-                            time.sleep(1.2)
-                            st.rerun()
-                        else:
-                            st.error("Не вдалося знайти клан для цього нікнейму.")
+            # МЕНЮ КЛАНУ ТІЛЬКИ ДЛЯ АДМІНА
+            if is_admin:
+                st.divider()
+                st.markdown("**🛡️ Отримати блок з Клану**")
+                clan_nick_search = st.text_input("Нікнейм гравця клану")
+                if st.button("📥 Завантажити склад клану", width='stretch'):
+                    if clan_nick_search:
+                        api_client = StalzoneApiClient(API_CLIENT_ID, API_CLIENT_SECRET, region)
+                        with st.spinner(f"Запит клану для {clan_nick_search}..."):
+                            c_name, c_members = api_client.fetch_clan_members_by_player(clan_nick_search)
+                            if c_name and c_members:
+                                db.save_group(c_name, c_members, owner="admin")
+                                st.success(f"✅ Клан '{c_name}' додано! Отримано {len(c_members)} гравців.")
+                                time.sleep(1.2)
+                                st.rerun()
+                            else:
+                                st.error("Не вдалося знайти клан для цього нікнейму.")
 
     # ---------------- ГОЛОВНА НАВІГАЦІЯ ----------------
     st.markdown("<div class='nav-header'>🧭 Розділи системи аналітики</div>", unsafe_allow_html=True)
 
-    main_menu_options = [
-        "📋 До КВ (Основна статистика)",
-        "⚔️ Після КВ \\ Зріз (Аналітика)",
-        "🎴 Картка гравців",
-        "🛡️ Кланові метрики"
-    ]
+    if is_admin:
+        main_menu_options = [
+            "📋 До КВ (Основна статистика)",
+            "⚔️ Після КВ \\ Зріз (Аналітика)",
+            "🎴 Картка гравців",
+            "🛡️ Кланові метрики"
+        ]
+    else:
+        main_menu_options = [
+            "📋 Основна статистика",
+            "⚔️ Зріз (аналітика)",
+            "🎴 Картка гравців"
+        ]
 
     if hasattr(st, "segmented_control"):
         mode = st.segmented_control("Головне меню", options=main_menu_options, default=main_menu_options[0],
@@ -868,7 +926,7 @@ def main():
     col_btn_space, col_btn = st.columns([3, 1], vertical_alignment="center")
 
     with col_btn:
-        fetch_data_btn = st.button("📥 Отримати дані", type="primary", width="stretch")
+        fetch_data_btn = st.button("📥 Отримати дані", type="primary", width='stretch')
 
     if fetch_data_btn:
         if not active_nicks:
@@ -896,8 +954,8 @@ def main():
 
     st.divider()
 
-    # ---------------- РЕЖИМ 1: ДО КВ (ОСНОВНА СТАТИСТИКА) ----------------
-    if mode == "📋 До КВ (Основна статистика)":
+    # ---------------- РЕЖИМ 1: ОСНОВНА СТАТИСТИКА ----------------
+    if mode in ["📋 До КВ (Основна статистика)", "📋 Основна статистика"]:
         if not active_nicks:
             st.info("👈 Оберіть або створіть блок гравців у панелі ліворуч.")
             return
@@ -949,10 +1007,10 @@ def main():
                 })
 
         df_pre = pd.DataFrame(act_rows)
-        st.dataframe(df_pre, width="stretch", height=450)
+        st.dataframe(df_pre, width='stretch', height=450)
 
-    # ---------------- РЕЖИМ 2: ПІСЛЯ КВ \ ЗРІЗ (АНАЛІТИКА) ----------------
-    elif mode == "⚔️ Після КВ \\ Зріз (Аналітика)":
+    # ---------------- РЕЖИМ 2: ЗРІЗ (АНАЛІТИКА) ----------------
+    elif mode in ["⚔️ Після КВ \\ Зріз (Аналітика)", "⚔️ Зріз (аналітика)"]:
         if not active_nicks:
             st.info("👈 Оберіть або створіть блок гравців у панелі ліворуч.")
             return
@@ -965,20 +1023,20 @@ def main():
         if is_custom_complete:
             col_info, col_choice = st.columns([2, 1])
             with col_info:
-                st.info("⏱️ Знайдено збережений **Екстренний зріз** (Початок -> Кінець).")
+                st.info("⏱️ Знайдено збережений **Екстренний/Ручний зріз** (Початок -> Кінець).")
             with col_choice:
                 analytics_source = st.radio(
                     "Джерело аналітики:",
-                    options=["⏱️ Екстренний зріз", "⚔️ Стандартний КВ (21:00 -> КВ)"],
+                    options=["⏱️ Ручний зріз", "⚔️ Стандартний КВ (21:00 -> КВ)"],
                     horizontal=True
                 )
         elif is_tracking_active:
-            st.warning("⏳ **Екстренний зріз у процесі!** Натисніть 🛑 Кінець в сайдбарі після закінчення.")
+            st.warning("⏳ **Зріз у процесі!** Натисніть 🛑 Кінець в сайдбарі після закінчення.")
         else:
-            st.info("⚔️ Відображається статистика КВ (21:00 -> кінець КВ або поточні дані).")
+            st.info("⚔️ Відображається статистика за наявними даними.")
 
         rows = []
-        use_custom = (analytics_source == "⏱️ Екстренний зріз") and is_custom_complete
+        use_custom = (analytics_source == "⏱️ Ручний зріз") and is_custom_complete
 
         for nick in active_nicks:
             if use_custom:
@@ -1028,7 +1086,7 @@ def main():
             .map(AnalyticsEngine.get_color_style, subset=["У/С", "УП/С", "УН/УП"])
             .map(AnalyticsEngine.get_tp_diff_style, subset=["Різниця з загальним (%)"])
         )
-        st.dataframe(styled_df, width="stretch", height=450)
+        st.dataframe(styled_df, width='stretch', height=450)
 
     # ---------------- РЕЖИМ 3: 🎴 КАРАТКА ГРАВЦІВ ----------------
     elif mode == "🎴 Картка гравців":
@@ -1038,7 +1096,7 @@ def main():
 
         card_sub_mode = st.tabs(["🏆 Тирлист (Tier List)", "👤 Персональна картка гравця"])
 
-        # ---------------- 🏆 ТИРЛИСТ (TIER LIST) ----------------
+        # 🏆 ТИРЛИСТ (TIER LIST)
         with card_sub_mode[0]:
             st.subheader(f"🏆 Тирлист гравців блоку '{selected_group}'")
 
@@ -1047,17 +1105,17 @@ def main():
             with col_tp_m:
                 tp_mode = st.radio(
                     "Режим обчислення рейтингу ТР:",
-                    options=["🔥 Загальний ТР (Total Power)", "⚔️ ТР за КВ / Зріз (Slice TP)"],
+                    options=["🔥 Загальний ТР (Total Power)", "⚔️ ТР за Зріз (Slice TP)"],
                     horizontal=True
                 )
 
             tp_multiplier = 1.0
             penalty_pct = 0.0
 
-            if tp_mode == "⚔️ ТР за КВ / Зріз (Slice TP)":
+            if tp_mode == "⚔️ ТР за Зріз (Slice TP)":
                 with col_opp:
                     opp_rating = st.number_input(
-                        "⚔️ Рейтинг противника (КВ):",
+                        "⚔️ Рейтинг противника:",
                         min_value=100,
                         max_value=3000,
                         value=1500,
@@ -1105,7 +1163,6 @@ def main():
                         m = AnalyticsEngine.compute_cw_metrics(start, end)
                         tp_val = round(m["slice_tp"] * tp_multiplier, 1)
 
-                # 🛑 Ігноруємо гравців з ТР < 10 (не грали)
                 if tp_val < 10.0:
                     continue
 
@@ -1141,7 +1198,7 @@ def main():
                 </div>
                 """, unsafe_allow_html=True)
 
-        # ---------------- 👤 ПЕРСОНАЛЬНА КАРАТКА ----------------
+        # 👤 ПЕРСОНАЛЬНА КАРАТКА
         with card_sub_mode[1]:
             st.subheader(f"🎴 Персональна картка аналітики")
 
@@ -1224,8 +1281,8 @@ def main():
                     with col_d30:
                         build_delta_col("За 30 Днів (Місяць)", 30)
 
-    # ---------------- РЕЖИМ 4: 🛡️ КЛАНОВІ МЕТРИКИ ----------------
-    elif mode == "🛡️ Кланові метрики":
+    # ---------------- РЕЖИМ 4: 🛡️ КЛАНОВІ МЕТРИКИ (ТІЛЬКИ АДМІН) ----------------
+    elif mode == "🛡️ Кланові метрики" and is_admin:
         st.subheader("🛡️ Клановий менеджмент & Конструктор Загонів")
 
         if not active_nicks:
@@ -1271,7 +1328,7 @@ def main():
 
                 col_sq_b1, col_sq_b2 = st.columns(2)
                 with col_sq_b1:
-                    if st.button("💾 Зберегти загін", width="stretch"):
+                    if st.button("💾 Зберегти загін", width='stretch'):
                         if squad_name and selected_squad_members:
                             db.save_squad(squad_name, selected_group, max_slots, selected_squad_members)
                             st.success(f"Загін '{squad_name}' збережено!")
@@ -1282,7 +1339,7 @@ def main():
 
                 with col_sq_b2:
                     if saved_squads and squad_name in saved_squads:
-                        if st.button("🗑️ Видалити", type="secondary", width="stretch"):
+                        if st.button("🗑️ Видалити", type="secondary", width='stretch'):
                             db.delete_squad(squad_name)
                             st.warning(f"Загін '{squad_name}' видалено!")
                             time.sleep(1)
@@ -1322,7 +1379,7 @@ def main():
 
                     st.markdown("#### 📜 Склад загону:")
                     df_squad = pd.DataFrame(squad_details)
-                    st.dataframe(df_squad, width="stretch")
+                    st.dataframe(df_squad, width='stretch')
 
         with clan_tabs[1]:
             st.info("💡 У цьому розділі незабаром з'являться порівняльні таблиці між різними кланами та детальна аналітика відвідуваності КВ.")
