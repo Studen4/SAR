@@ -12,13 +12,21 @@ import streamlit as st
 
 # Конфігурація API
 try:
-    from api_config import API_CLIENT_ID, API_CLIENT_SECRET, API_BASE_URL, API_BEARER_TOKEN_SEMI, API_BEARER_TOKEN
+    # 1. Локальна розробка: імпортуємо змінні з api_config.py
+    from api_config import (
+        API_CLIENT_ID,
+        API_CLIENT_SECRET,
+        API_BASE_URL,
+        API_BEARER_TOKEN_SEMI,
+        API_BEARER_TOKEN,
+    )
 except ImportError:
-    API_CLIENT_ID = ""
-    API_CLIENT_SECRET = ""
-    API_BASE_URL = "https://eapi.stalzone.com"
-    API_BEARER_TOKEN_SEMI = ""
-    API_BEARER_TOKEN = ""
+    # 2. Сервер (Streamlit Cloud): підхоплюємо змінні з st.secrets
+    API_CLIENT_ID = st.secrets.get("API_CLIENT_ID", "")
+    API_CLIENT_SECRET = st.secrets.get("API_CLIENT_SECRET", "")
+    API_BASE_URL = st.secrets.get("API_BASE_URL", "https://eapi.stalzone.com")
+    API_BEARER_TOKEN_SEMI = st.secrets.get("API_BEARER_TOKEN_SEMI", "")
+    API_BEARER_TOKEN = st.secrets.get("API_BEARER_TOKEN", "")
 
 logging.basicConfig(
     level=logging.INFO,
