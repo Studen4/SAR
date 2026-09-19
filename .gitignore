@@ -1,0 +1,20 @@
+# Конфігурація та секрети
+api_config.py
+
+# База даних та локальний стан
+*.db
+*.db-shm
+*.db-wal
+users.json
+
+# Кеш та тимчасові файли
+__pycache__/
+*.pyc
+.streamlit/
+camoufox_profile/
+
+# Збірки
+build/
+dist/
+installer_output/
+*.spec
