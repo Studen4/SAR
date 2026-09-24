@@ -9,10 +9,13 @@ import pandas as pd
 import pytz
 import requests
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from clan import render_clan_metrics_tab
+from drive_uploader import upload_db_to_drive, download_latest_db_from_drive
 
 # Конфігурація API
 try:
-    # 1. Локальна розробка: імпортуємо змінні з api_config.py
     from api_config import (
         API_CLIENT_ID,
         API_CLIENT_SECRET,
@@ -21,7 +24,6 @@ try:
         API_BEARER_TOKEN,
     )
 except ImportError:
-    # 2. Сервер (Streamlit Cloud): підхоплюємо змінні з st.secrets
     API_CLIENT_ID = st.secrets.get("API_CLIENT_ID", "")
     API_CLIENT_SECRET = st.secrets.get("API_CLIENT_SECRET", "")
     API_BASE_URL = st.secrets.get("API_BASE_URL", "https://eapi.stalzone.com")
@@ -38,7 +40,66 @@ KYIV_TZ = pytz.timezone("Europe/Kyiv")
 
 
 # ==========================================
-# 0. СИСТЕМА АВТОРИЗАЦІЇ (AUTH)
+# АВТО-СИНХРОНІЗАЦІЯ ПРИ СТАРТІ / ВІДКАТІ
+# ==========================================
+def auto_sync_db_on_startup():
+    """
+    Перевіряє стан локальної БД при старті сесії.
+    Якщо локальна база відкатана або порожня, автоматично викачує останню версію з Google Drive.
+    """
+    if "db_auto_synced" not in st.session_state:
+        st.session_state.db_auto_synced = True
+        db = DatabaseManager()
+        try:
+            with db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM player_groups")
+                groups_cnt = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM daily_snapshots")
+                snaps_cnt = cursor.fetchone()[0]
+
+            # Якщо база повністю порожня (Streamlit скинув стан)
+            if groups_cnt == 0 and snaps_cnt == 0:
+                logger.info("⚠️ Виявлено порожню/відкатану БД. Виконується авто-відновлення з Google Drive...")
+                if download_latest_db_from_drive():
+                    logger.info("✅ Автоматичне відновлення з Google Drive пройшло успішно.")
+        except Exception as e:
+            logger.error(f"❌ Помилка при перевірці авто-синхронізації БД: {e}")
+
+
+# ==========================================
+# 0. СИСТЕМА КЕШУВАННЯ API (15-СЕКУНДНИЙ БУФЕР)
+# ==========================================
+class APICache:
+    """Thread-safe кеш з TTL в 15 секунд для запобігання лимитам API."""
+
+    def __init__(self, ttl_seconds: int = 15):
+        self.ttl = ttl_seconds
+        self._cache = {}
+        self._lock = threading.Lock()
+
+    def get(self, nickname: str, region: str):
+        key = (nickname.strip().lower(), region.strip().lower())
+        with self._lock:
+            if key in self._cache:
+                ts, data = self._cache[key]
+                if time.time() - ts < self.ttl:
+                    return data
+                else:
+                    del self._cache[key]
+            return None
+
+    def set(self, nickname: str, region: str, data: dict):
+        key = (nickname.strip().lower(), region.strip().lower())
+        with self._lock:
+            self._cache[key] = (time.time(), data)
+
+
+global_api_cache = APICache(ttl_seconds=15)
+
+
+# ==========================================
+# 1. СИСТЕМА АВТОРИЗАЦІЇ (AUTH)
 # ==========================================
 def check_authentication() -> bool:
     if "authenticated" not in st.session_state:
@@ -50,7 +111,6 @@ def check_authentication() -> bool:
         auth_file = "users.json"
         users_db = {}
 
-        # 1. Спочатку шукаємо локальний users.json (для розробки на комп'ютері)
         if os.path.exists(auth_file):
             try:
                 with open(auth_file, "r", encoding="utf-8") as f:
@@ -60,18 +120,14 @@ def check_authentication() -> bool:
                     if isinstance(data, dict):
                         users_db[user] = data
                     else:
-                        # Сумісність зі старим форматом
                         role = "admin" if user in ["admin", "1111"] else "user"
                         users_db[user] = {"password": str(data), "role": role}
             except Exception as e:
                 st.error(f"Помилка зчитування users.json: {e}")
 
-        # 2. Якщо файлу немає (на сервері Streamlit Cloud) — беремо з Secrets
         elif "users" in st.secrets:
             users_db = dict(st.secrets["users"])
 
-        # 3. Резервний варіант (якщо немає ні файлу, ні secrets)
-        # Створюємо ТІЛЬКИ в пам'яті 1 гостьового користувача БЕЗ прав адміна
         if not users_db:
             users_db = {
                 "guest": {"password": "guestpassword123", "role": "user"}
@@ -84,10 +140,9 @@ def check_authentication() -> bool:
             username = st.text_input("Логін")
             password = st.text_input("Пароль", type="password")
 
-            if st.button("Увійти", type="primary", use_container_width=True):
+            if st.button("Увійти", type="primary", width='stretch'):
                 user_entry = users_db.get(username)
 
-                # Перевіряємо пароль (і з диска, і з secrets)
                 if user_entry and str(user_entry.get("password")) == str(password):
                     st.session_state.authenticated = True
                     st.session_state.username = username
@@ -102,7 +157,7 @@ def check_authentication() -> bool:
 
 
 # ==========================================
-# 1. API КЛІЄНТ ДЛЯ ОТРИМАННЯ ДАНИХ (eAPI)
+# 2. API КЛІЄНТ ДЛЯ ОТРИМАННЯ ДАНИХ (eAPI)
 # ==========================================
 class StalzoneApiClient:
     def __init__(self, client_id: str = "", client_secret: str = "", region: str = "EU"):
@@ -142,6 +197,10 @@ class StalzoneApiClient:
             return False
 
     def fetch_player_stats(self, nickname: str) -> dict:
+        cached_result = global_api_cache.get(nickname, self.region)
+        if cached_result:
+            return cached_result
+
         empty_stats = {
             "nickname": nickname, "status": "Error",
             "kills": 0, "assists": 0, "deaths": 0, "playtime": 0,
@@ -152,7 +211,8 @@ class StalzoneApiClient:
         if not self._authenticate():
             return empty_stats
 
-        url = f"{API_BASE_URL.rstrip('/')}/{self.region.upper()}/character/by-name/{nickname}/profile"
+        safe_nick = requests.utils.quote(nickname.strip())
+        url = f"{API_BASE_URL.rstrip('/')}/{self.region.upper()}/character/by-name/{safe_nick}/profile"
         headers = {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json"
@@ -163,12 +223,13 @@ class StalzoneApiClient:
             if res.status_code == 200:
                 data = res.json()
                 stats_raw = data.get("stats", [])
-                stats_map = {item["id"]: item.get("value", 0) for item in stats_raw if isinstance(item, dict) and "id" in item}
+                stats_map = {item["id"]: item.get("value", 0) for item in stats_raw if
+                             isinstance(item, dict) and "id" in item}
 
                 playtime_ms = stats_map.get("pla-tim", 0)
                 playtime_min = round(playtime_ms / (1000 * 60))
 
-                return {
+                result = {
                     "nickname": data.get("username", nickname),
                     "status": "OK",
                     "kills": stats_map.get("kil", 0),
@@ -182,6 +243,8 @@ class StalzoneApiClient:
                     "bodyshots": stats_map.get("sho-bod", 0),
                     "limbshots": stats_map.get("sho-lim", 0)
                 }
+                global_api_cache.set(nickname, self.region, result)
+                return result
             else:
                 logger.error(f"⚠️ Помилка отримання профілю {nickname}: HTTP {res.status_code}")
                 return empty_stats
@@ -252,10 +315,11 @@ class StalzoneApiClient:
                                 members.append(m)
                             elif isinstance(m, dict):
                                 name = (
-                                    m.get("username") or m.get("name") or m.get("nickname") or
-                                    m.get("characterName") or
-                                    (m.get("character") if isinstance(m.get("character"), str) else None) or
-                                    (m.get("character", {}).get("name") if isinstance(m.get("character"), dict) else None)
+                                        m.get("username") or m.get("name") or m.get("nickname") or
+                                        m.get("characterName") or
+                                        (m.get("character") if isinstance(m.get("character"), str) else None) or
+                                        (m.get("character", {}).get("name") if isinstance(m.get("character"),
+                                                                                          dict) else None)
                                 )
                                 if name:
                                     members.append(name)
@@ -268,9 +332,45 @@ class StalzoneApiClient:
             logger.error(f"❌ Помилка отримання складу клану: {e}")
             return None, []
 
+    def fetch_bulk_player_stats(self, nicknames: list, batch_size: int = 10, progress_callback=None) -> dict:
+        if not nicknames:
+            return {}
+
+        results = {}
+        total_count = len(nicknames)
+        completed_count = 0
+        workers = min(max(1, batch_size), len(nicknames))
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_nick = {executor.submit(self.fetch_player_stats, nick): nick for nick in nicknames}
+
+            for future in as_completed(future_to_nick):
+                nick = future_to_nick[future]
+                try:
+                    stats = future.result()
+                    results[nick] = stats
+                except Exception as e:
+                    logger.error(f"❌ Помилка отримання статистики для {nick}: {e}", exc_info=True)
+                    results[nick] = {
+                        "nickname": nick, "status": "Error",
+                        "kills": 0, "assists": 0, "deaths": 0, "playtime": 0,
+                        "damage_dealt": 0, "damage_recv": 0, "grenades": 0,
+                        "headshots": 0, "bodyshots": 0, "limbshots": 0
+                    }
+
+                completed_count += 1
+
+                if progress_callback:
+                    try:
+                        progress_callback(completed_count, total_count, nick)
+                    except Exception as cb_err:
+                        logger.error(f"⚠️ Помилка виклику progress_callback для {nick}: {cb_err}")
+
+        return results
+
 
 # ==========================================
-# 2. МЕНЕДЖЕР БД (SQLite з підтримкою Owner)
+# 3. МЕНЕДЖЕР БД (SQLite)
 # ==========================================
 class DatabaseManager:
     def __init__(self, db_path: str = "stalzone_stats.db"):
@@ -292,14 +392,13 @@ class DatabaseManager:
                 )
             """)
 
-            # Безпечна міграція для старих версій БД
             cursor.execute("PRAGMA table_info(player_groups)")
             columns = [col[1] for col in cursor.fetchall()]
             if "owner" not in columns:
                 try:
                     cursor.execute("ALTER TABLE player_groups ADD COLUMN owner TEXT DEFAULT 'admin'")
                 except sqlite3.OperationalError:
-                    pass  # Колонка вже була додана паралельним потоком
+                    pass
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS daily_snapshots (
@@ -321,6 +420,12 @@ class DatabaseManager:
                     members TEXT NOT NULL
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
             conn.commit()
 
     def save_group(self, name: str, nicknames: list, owner: str = "admin"):
@@ -331,6 +436,15 @@ class DatabaseManager:
                 INSERT INTO player_groups (group_name, nicknames, owner) VALUES (?, ?, ?)
                 ON CONFLICT(group_name) DO UPDATE SET nicknames=excluded.nicknames, owner=excluded.owner
             """, (name, nicks_str, owner))
+            conn.commit()
+
+    def delete_group(self, name: str, owner: str = "admin"):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if owner == "admin":
+                cursor.execute("DELETE FROM player_groups WHERE group_name = ?", (name,))
+            else:
+                cursor.execute("DELETE FROM player_groups WHERE group_name = ? AND owner = ?", (name, owner))
             conn.commit()
 
     def get_groups(self, owner: str = "admin") -> dict:
@@ -349,6 +463,21 @@ class DatabaseManager:
             cursor.execute("SELECT group_name, nicknames FROM player_groups WHERE owner = 'admin' OR owner IS NULL")
             rows = cursor.fetchall()
             return {row[0]: [n.strip() for n in row[1].split(",") if n.strip()] for row in rows}
+
+    def set_setting(self, key: str, value: str):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value))
+            conn.commit()
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return row[0] if row else default
 
     def save_squad(self, squad_name: str, group_name: str, max_slots: int, members: list):
         m_str = ",".join(members)
@@ -446,7 +575,7 @@ class DatabaseManager:
 
 
 # ==========================================
-# 3. АВТОМАТИЧНИЙ ФОНОВИЙ ПЛАНУВАЛЬНИК (ТІЛЬКИ ГЛОБАЛЬНІ БЛОКИ)
+# 4. АВТОМАТИЧНИЙ ФОНОВИЙ ПЛАНУВАЛЬНИК
 # ==========================================
 def run_background_scheduler():
     logger.info("⏰ Фоновий автозбір даних за розкладом запущено!")
@@ -463,46 +592,62 @@ def run_background_scheduler():
             target_cw_hour, target_cw_min = (22, 0) if weekday in [6, 0, 1, 2] else (22, 15)
 
             db = DatabaseManager()
-            # Тільки глобальні (кланові / адмін) блоки для автоматичного запису!
             groups = db.get_global_groups()
-            all_nicks = set()
-            for group_nicks in groups.values():
-                all_nicks.update(group_nicks)
+            sorted_groups = sorted(groups.items(), key=lambda x: len(x[1]), reverse=True)
 
-            if all_nicks:
+            if sorted_groups:
                 api_client = StalzoneApiClient(API_CLIENT_ID, API_CLIENT_SECRET, "EU")
 
-                # 1. Запит о 00:00
                 if hour == 0 and minute == 0 and (today_str, "00:00") not in executed_tasks:
-                    logger.info("⏰ [SCHEDULE] Виконання автоматичного зрізу 00:00 для глобальних блоків...")
-                    for nick in all_nicks:
-                        stats = api_client.fetch_player_stats(nick)
-                        if stats.get("status") == "OK":
-                            db.save_snapshot("00:00", stats)
+                    logger.info("⏰ [SCHEDULE] Виконання зрізу 00:00...")
+                    for g_name, g_nicks in sorted_groups:
+                        for nick in g_nicks:
+                            stats = api_client.fetch_player_stats(nick)
+                            if stats.get("status") == "OK":
+                                db.save_snapshot("00:00", stats)
                     executed_tasks[(today_str, "00:00")] = True
                     logger.info("✅ [SCHEDULE] Зріз 00:00 завершено.")
 
-                # 2. Запит о 21:00
-                if hour == 21 and minute == 0 and (today_str, "21:00") not in executed_tasks:
-                    logger.info("⏰ [SCHEDULE] Виконання автоматичного зрізу 21:00 для глобальних блоків...")
-                    for nick in all_nicks:
-                        stats = api_client.fetch_player_stats(nick)
-                        if stats.get("status") == "OK":
-                            db.save_snapshot("21:00", stats)
+                cw_blocks_str = db.get_setting("cw_scan_blocks", "")
+                cw_blocks = json.loads(cw_blocks_str) if cw_blocks_str else []
+                if not cw_blocks and sorted_groups:
+                    cw_blocks = [sorted_groups[0][0]]
+
+                if hour == 20 and minute == 59 and (today_str, "21:00") not in executed_tasks:
+                    logger.info("⏰ [SCHEDULE] Виконання КВ зрізу 21:00 (запуск 20:59)...")
+                    for g_name in cw_blocks:
+                        if g_name in groups:
+                            for nick in groups[g_name]:
+                                stats = api_client.fetch_player_stats(nick)
+                                if stats.get("status") == "OK":
+                                    db.save_snapshot("21:00", stats)
                     db.clear_daily_data("CUSTOM_START")
                     db.clear_daily_data("CUSTOM_END")
                     executed_tasks[(today_str, "21:00")] = True
                     logger.info("✅ [SCHEDULE] Зріз 21:00 завершено.")
 
-                # 3. Запит після КВ
-                if hour == target_cw_hour and minute == target_cw_min and (today_str, "CW_END") not in executed_tasks:
-                    logger.info(f"⏰ [SCHEDULE] Виконання автоматичного зрізу CW_END ({target_cw_hour}:{target_cw_min:02d}) для глобальних блоків...")
-                    for nick in all_nicks:
-                        stats = api_client.fetch_player_stats(nick)
-                        if stats.get("status") == "OK":
-                            db.save_snapshot("CW_END", stats)
+                target_cw_total_mins = target_cw_hour * 60 + target_cw_min - 1
+                curr_total_mins = hour * 60 + minute
+
+                if curr_total_mins == target_cw_total_mins and (today_str, "CW_END") not in executed_tasks:
+                    logger.info(f"⏰ [SCHEDULE] Виконання зрізу CW_END (запуск о {hour}:{minute:02d})...")
+                    for g_name in cw_blocks:
+                        if g_name in groups:
+                            for nick in groups[g_name]:
+                                stats = api_client.fetch_player_stats(nick)
+                                if stats.get("status") == "OK":
+                                    db.save_snapshot("CW_END", stats)
                     executed_tasks[(today_str, "CW_END")] = True
                     logger.info("✅ [SCHEDULE] Зріз CW_END завершено.")
+
+            # --- АВТОМАТИЧНЕ ЗБЕРЕЖЕННЯ ТА ПЕРЕДАЧА НА GOOGLE DRIVE О 23:00 ЗА КИЄВОМ ---
+            if hour == 23 and minute == 0 and (today_str, "23:00_DRIVE") not in executed_tasks:
+                logger.info("⏰ [SCHEDULE] Запуск автоматичного збереження та передачі БД на Google Drive (23:00 Kyiv)...")
+                if upload_db_to_drive():
+                    executed_tasks[(today_str, "23:00_DRIVE")] = True
+                    logger.info("✅ [SCHEDULE] Резервну копію БД успішно відправлено на Google Drive!")
+                else:
+                    logger.error("❌ [SCHEDULE] Помилка відправки резервної копії БД на Google Drive.")
 
             cutoff = (now_kyiv - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
             for key in list(executed_tasks.keys()):
@@ -523,7 +668,7 @@ def start_scheduler():
 
 
 # ==========================================
-# 4. АНАЛІТИЧНИЙ ДВИГУН ТА ТР (TOTAL POWER)
+# 5. АНАЛІТИЧНИЙ ДВИГУН ТА ТР (TOTAL POWER)
 # ==========================================
 class AnalyticsEngine:
     @staticmethod
@@ -647,9 +792,51 @@ class AnalyticsEngine:
             "un_up": un_up
         }
 
+    @staticmethod
+    def calculate_clan_avg_grenades(db: DatabaseManager, group_nicks: list, live_stats: dict = None) -> float:
+        snap_custom_start = db.get_snapshot("CUSTOM_START")
+        snap_custom_end = db.get_snapshot("CUSTOM_END")
+
+        snap_00 = db.get_snapshot("00:00")
+        snap_21 = db.get_snapshot("21:00")
+        snap_cw = db.get_snapshot("CW_END")
+
+        use_custom = bool(snap_custom_start and snap_custom_end)
+        active_players_data = {}
+
+        for nick in group_nicks:
+            if use_custom:
+                start = snap_custom_start.get(nick, {})
+                end = snap_custom_end.get(nick, {})
+            else:
+                start = snap_21.get(nick) or snap_00.get(nick) or {}
+                end = (live_stats.get(nick) if live_stats else None) or snap_cw.get(nick) or {}
+
+            if not start or not end:
+                continue
+
+            m = AnalyticsEngine.compute_cw_metrics(start, end)
+            slice_tp = m.get("slice_tp", 0.0)
+            d_grenades = m.get("grenades", 0)
+
+            if slice_tp > 10.0:
+                active_players_data[nick] = (slice_tp, d_grenades)
+
+        sorted_active = sorted(active_players_data.items(), key=lambda x: x[1][0], reverse=True)[:25]
+
+        if not sorted_active:
+            return 0.0
+
+        player_grenades = {nick: data[1] for nick, data in sorted_active}
+        total_grenades = sum(player_grenades.values())
+        players_count = len(player_grenades)
+        avg_grenades = round(total_grenades / players_count, 1)
+
+        return avg_grenades
+
 
 # ==========================================
-# 5. STREAMLIT ІНТЕРФЕЙС
+# 6. STREAMLIT ІНТЕРФЕЙС
 # ==========================================
 def main():
     st.set_page_config(page_title="SAR", layout="wide", initial_sidebar_state="expanded")
@@ -657,12 +844,13 @@ def main():
     if not check_authentication():
         return
 
-    # Перевірка ролі користувача
+    # Автоматичне відновлення актуальної бакап-бази з Google Drive у разі відкату
+    auto_sync_db_on_startup()
+
     username = st.session_state.get("username", "admin")
     user_role = st.session_state.get("role", "user")
     is_admin = (user_role == "admin")
 
-    # Запуск авто-планувальника
     start_scheduler()
 
     st.markdown("""
@@ -733,7 +921,6 @@ def main():
 
         st.divider()
 
-        # Швидкі інструменти
         col_btn1, col_btn2 = st.columns(2)
 
         with col_btn1:
@@ -780,19 +967,85 @@ def main():
         st.divider()
         st.subheader("Управління блоками")
 
-        # Для адміна завантажуються глобальні блоки, для юзера — тільки власні
         groups = db.get_groups(owner="admin" if is_admin else username)
         group_names = list(groups.keys())
-        selected_group = st.selectbox("Обрати блок для перегляду", options=["-- Не обрано --"] + group_names)
+
+        col_grp1, col_grp2 = st.columns([3, 1])
+        with col_grp1:
+            selected_group = st.selectbox("Обрати блок для перегляду", options=["-- Не обрано --"] + group_names)
+
+        with col_grp2:
+            if selected_group and selected_group != "-- Не обрано --":
+                if st.button("🗑️", help="Видалити цей блок повністю"):
+                    db.delete_group(selected_group, owner="admin" if is_admin else username)
+                    st.success(f"Блок '{selected_group}' видалено!")
+                    time.sleep(1)
+                    st.rerun()
 
         active_nicks = groups.get(selected_group, []) if selected_group and selected_group != "-- Не обрано --" else []
 
         st.markdown("---")
 
-        # 🛠️ ДЕБАГ-БЛОК ДЛЯ АДМІНІСТРАТОРІВ
         if is_admin:
             with st.expander("🛠️ Тестові кнопки замірів (Debug)", expanded=False):
                 st.caption("Керування зрізами в БД для ручної перевірки обчислень.")
+
+                st.markdown("**⚔️ Сканування КВ (21:00 / CW_END):**")
+                all_global_groups = db.get_global_groups()
+                sorted_g_names = [g[0] for g in
+                                  sorted(all_global_groups.items(), key=lambda x: len(x[1]), reverse=True)]
+
+                saved_cw_str = db.get_setting("cw_scan_blocks", "")
+                saved_cw_blocks = json.loads(saved_cw_str) if saved_cw_str else (
+                    [sorted_g_names[0]] if sorted_g_names else [])
+
+                selected_cw_blocks = st.multiselect(
+                    "Блоки для авто-скану на КВ:",
+                    options=sorted_g_names,
+                    default=[b for b in saved_cw_blocks if b in sorted_g_names],
+                    help="По дефолту сканується 1 найбiльший блок (клан). Можна додати ще блок суперника."
+                )
+                if st.button("💾 Зберегти блоки КВ", width='stretch'):
+                    db.set_setting("cw_scan_blocks", json.dumps(selected_cw_blocks))
+                    st.success("✅ Налаштування КВ блоків збережено!")
+                    time.sleep(1)
+                    st.rerun()
+
+                st.divider()
+
+                # ==================== ДЕБАГГЕР: ХМАРНЕ ЗБЕРЕЖЕННЯ GOOGLE DRIVE ====================
+                st.caption("☁️ Резервне копіювання Google Drive")
+                col_gd1, col_gd2 = st.columns(2)
+
+                with col_gd1:
+                    if st.button("☁️ Зберегти БД на Drive", width='stretch', help="Миттєво зберегти стан БД у хмару"):
+                        with st.spinner("Завантаження бакапу на Google Drive..."):
+                            if upload_db_to_drive():
+                                st.success("✅ Стан БД збережено на Google Drive!")
+                            else:
+                                st.error("❌ Не вдалося зберегти БД на Drive.")
+
+                with col_gd2:
+                    if st.button("📥 Відновити БД з Drive", width='stretch', help="Завантажити останій актуальний бакап"):
+                        with st.spinner("Викачування бакапу з Google Drive..."):
+                            if download_latest_db_from_drive():
+                                st.success("✅ БД оновлено з Google Drive!")
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.error("❌ Не вдалося викачати бакап.")
+
+                if os.path.exists("stalzone_stats.db"):
+                    with open("stalzone_stats.db", "rb") as fp:
+                        st.download_button(
+                            label="💾 Скачати stalzone_stats.db на ПК",
+                            data=fp,
+                            file_name="stalzone_stats.db",
+                            mime="application/x-sqlite3",
+                            width='stretch'
+                        )
+
+                st.divider()
 
                 if st.button("🗑️ Скинути всі заміри", type="secondary", width='stretch'):
                     db.clear_daily_data()
@@ -818,24 +1071,26 @@ def main():
 
                 col_hist1, col_hist2 = st.columns(2)
                 with col_hist1:
-                    if st.button("📸 1 день тому", width='stretch', help="Зберегти поточні дані з датою -1 день"):
+                    if st.button("📸 1 день тому", width='stretch', help="Зберегти дані за -1 день"):
                         if not st.session_state.live_stats:
-                            st.warning("Спочатку спарсіть/отримайте дані!")
+                            st.warning("Спочатку отримайте дані!")
                         else:
-                            ts_1d = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+                            ts_1d = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=1)).strftime(
+                                '%Y-%m-%d %H:%M:%S')
                             for nick, stats in st.session_state.live_stats.items():
                                 db.save_snapshot("DAILY_TEST_1D", stats, custom_timestamp=ts_1d)
                             st.success("✅ Записано тестовий зріз за 1 день тому!")
 
                 with col_hist2:
-                    if st.button("📸 7 днів тому", width='stretch', help="Зберегти поточні дані з датою -7 днів"):
+                    if st.button("📸 3 дні тому", width='stretch', help="Зберегти дані за -3 дні"):
                         if not st.session_state.live_stats:
-                            st.warning("Спочатку спарсіть/отримайте дані!")
+                            st.warning("Спочатку отримайте дані!")
                         else:
-                            ts_7d = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+                            ts_3d = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=3)).strftime(
+                                '%Y-%m-%d %H:%M:%S')
                             for nick, stats in st.session_state.live_stats.items():
-                                db.save_snapshot("DAILY_TEST_7D", stats, custom_timestamp=ts_7d)
-                            st.success("✅ Записано тестовий зріз за 7 днів тому!")
+                                db.save_snapshot("DAILY_TEST_3D", stats, custom_timestamp=ts_3d)
+                            st.success("✅ Записано тестовий зріз за 3 дні тому!")
 
                 st.divider()
 
@@ -843,7 +1098,7 @@ def main():
                     if not active_nicks:
                         st.error("Оберіть блок гравців у списку вище!")
                     elif not st.session_state.live_stats:
-                        st.warning("Спочатку отримайте дані ('Отримати дані')!")
+                        st.warning("Спочатку отримайте дані!")
                     else:
                         for nick in active_nicks:
                             if nick in st.session_state.live_stats:
@@ -856,7 +1111,7 @@ def main():
                     if not active_nicks:
                         st.error("Оберіть блок гравців у списку вище!")
                     elif not st.session_state.live_stats:
-                        st.warning("Спочатку отримайте дані ('Отримати дані')!")
+                        st.warning("Спочатку отримайте дані!")
                     else:
                         for nick in active_nicks:
                             if nick in st.session_state.live_stats:
@@ -874,7 +1129,7 @@ def main():
                     if not active_nicks:
                         st.error("Оберіть блок гравців у списку вище!")
                     elif not st.session_state.live_stats:
-                        st.warning("Спочатку отримайте дані ('Отримати дані')!")
+                        st.warning("Спочатку отримайте дані!")
                     else:
                         for nick in active_nicks:
                             if nick in st.session_state.live_stats:
@@ -883,7 +1138,37 @@ def main():
                         time.sleep(1)
                         st.rerun()
 
-        # ➕ СТВОРЕННЯ ТА РЕДАГУВАННЯ БЛОКУ
+                # ==================== БЛОК ІНСПЕКТОРА БАЗИ ДАНИХ ====================
+                st.divider()
+                st.caption("🗄️ Перегляд та інспекція таблиць БД")
+
+                try:
+                    db_path = getattr(db, 'db_path', 'stalzone_stats.db')
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
+
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                    tables = [t[0] for t in cursor.fetchall() if not t[0].startswith("sqlite_")]
+
+                    if tables:
+                        selected_table = st.selectbox("Оберіть таблицю БД:", options=tables,
+                                                      key="debug_db_table_select")
+
+                        if selected_table:
+                            limit = st.number_input("Ліміт рядків:", min_value=10, max_value=5000, value=100, step=50,
+                                                    key="debug_db_limit")
+
+                            df_table = pd.read_sql_query(f"SELECT * FROM {selected_table} LIMIT {limit}", conn)
+
+                            st.markdown(f"**Записи в `{selected_table}` (показано {len(df_table)}):**")
+                            st.dataframe(df_table, width='stretch')
+                    else:
+                        st.warning("В базі даних не знайдено жодної таблиці.")
+
+                    conn.close()
+                except Exception as e:
+                    st.error(f"Помилка зчитування БД: {e}")
+
         with st.expander("➕ Створити / Редагувати блок"):
             new_group_name = st.text_input("Назва блоку (напр. Мій загін)")
             default_nicks = "\n".join(groups.get(new_group_name, [])) if new_group_name in groups else ""
@@ -897,7 +1182,6 @@ def main():
                     st.success(f"Блок '{new_group_name}' збережено!")
                     st.rerun()
 
-            # МЕНЮ КЛАНУ ТІЛЬКИ ДЛЯ АДМІНА
             if is_admin:
                 st.divider()
                 st.markdown("**🛡️ Отримати блок з Клану**")
@@ -951,11 +1235,16 @@ def main():
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            total_nicks = len(active_nicks)
-            for i, nick in enumerate(active_nicks):
-                status_text.markdown(f"**Запит API для гравця:** `{nick}` ({i + 1}/{total_nicks}) ... ⏳")
-                st.session_state.live_stats[nick] = api_client.fetch_player_stats(nick)
-                progress_bar.progress((i + 1) / total_nicks)
+            def update_progress(current, total, last_nick):
+                status_text.markdown(f"**Паралельне сканування:** `{last_nick}` ({current}/{total}) ... ⏳")
+                progress_bar.progress(current / total)
+
+            results = api_client.fetch_bulk_player_stats(
+                active_nicks,
+                batch_size=10,
+                progress_callback=update_progress
+            )
+            st.session_state.live_stats.update(results)
 
             status_text.success("✅ Дані успішно отримані через eAPI!")
             time.sleep(1.2)
@@ -1213,7 +1502,7 @@ def main():
                 </div>
                 """, unsafe_allow_html=True)
 
-        # 👤 ПЕРСОНАЛЬНА КАРАТКА
+        # 👤 ПЕРСОНАЛЬНА КАРАТКА ГРАВЦЯ
         with card_sub_mode[1]:
             st.subheader(f"🎴 Персональна картка аналітики")
 
@@ -1242,14 +1531,14 @@ def main():
                     kd = AnalyticsEngine.calc_ratio(K, D)
                     kad = AnalyticsEngine.calc_ratio(K + A, D)
                     un_up = AnalyticsEngine.calc_ratio(DD, DR)
-                    head_pct = AnalyticsEngine.calc_ratio(HS * 100, total_shots) if total_shots > 0 else 0.0
+                    curr_head_pct = round((HS * 100 / total_shots), 2) if total_shots > 0 else 0.0
 
                     c1, c2, c3, c4, c5 = st.columns(5)
                     c1.metric("🔥 Total Power (TP)", current_tp)
                     c2.metric("🎯 K/D (У/С)", kd)
                     c3.metric("🤝 KAD (УП/С)", kad)
                     c4.metric("🛡️ УН / УП", un_up)
-                    c5.metric("🎯 % Влучань у голову", f"{head_pct}%")
+                    c5.metric("🎯 % Влучань у голову", f"{curr_head_pct:.2f}%")
 
                     st.divider()
                     st.markdown("### 📈 Динаміка змін (Було ➔ Стало)")
@@ -1257,7 +1546,7 @@ def main():
                     def build_delta_col(title: str, days_ago: int):
                         old_data = db.get_historical_snapshot(selected_player, days_ago)
                         if not old_data:
-                            st.caption(f"**{title}**: немає даних")
+                            st.caption(f"**{title}**: немає даних в БД")
                             return
 
                         old_tp = AnalyticsEngine.calc_tp(old_data)
@@ -1268,29 +1557,42 @@ def main():
                         old_DR = max(old_data.get("damage_recv", 0), 1)
 
                         old_HS = old_data.get("headshots", 0)
-                        old_total = old_HS + old_data.get("bodyshots", 0) + old_data.get("limbshots", 0)
+                        old_BS = old_data.get("bodyshots", 0)
+                        old_LS = old_data.get("limbshots", 0)
+                        old_total = old_HS + old_BS + old_LS
 
                         old_kd = AnalyticsEngine.calc_ratio(old_K, old_D)
                         old_kad = AnalyticsEngine.calc_ratio(old_K + old_A, old_D)
                         old_un_up = AnalyticsEngine.calc_ratio(old_DD, old_DR)
-                        old_head_pct = AnalyticsEngine.calc_ratio(old_HS * 100, old_total) if old_total > 0 else 0.0
+                        old_head_pct = round((old_HS * 100 / old_total), 2) if old_total > 0 else 0.0
 
                         tp_diff = round(current_tp - old_tp, 1)
                         kd_diff = round(kd - old_kd, 2)
                         kad_diff = round(kad - old_kad, 2)
                         un_up_diff = round(un_up - old_un_up, 2)
-                        head_diff = round(head_pct - old_head_pct, 1)
+                        head_diff = round(curr_head_pct - old_head_pct, 2)
 
                         st.markdown(f"#### {title}")
                         st.metric("Зміна TP", f"{current_tp}", delta=f"{tp_diff:+}")
-                        st.metric("Зміна K/D", f"{kd}", delta=f"{kd_diff:+}")
-                        st.metric("Зміна KAD", f"{kad}", delta=f"{kad_diff:+}")
-                        st.metric("Зміна УН/УП", f"{un_up}", delta=f"{un_up_diff:+}")
-                        st.metric("Зміна % Голови", f"{head_pct}%", delta=f"{head_diff:+}%")
 
-                    col_d1, col_d7, col_d30 = st.columns(3)
+                        st.markdown(f"**Кіли**: `{old_K}` ➔ `{K}` (`{K - old_K:+}`)")
+                        st.markdown(f"**Смерті**: `{old_D}` ➔ `{D}` (`{D - old_D:+}`)")
+                        st.markdown(f"**Асисти**: `{old_A}` ➔ `{A}` (`{A - old_A:+}`)")
+
+                        st.metric("Зміна K/D", f"{old_kd} ➔ {kd}", delta=f"{kd_diff:+}")
+                        st.metric("Зміна KAD", f"{old_kad} ➔ {kad}", delta=f"{kad_diff:+}")
+
+                        st.markdown(f"**Шкода**: `{int(old_DD):,}` / `{int(old_DR):,}` ➔ `{int(DD):,}` / `{int(DR):,}`")
+                        st.metric("Зміна УН/УП", f"{old_un_up} ➔ {un_up}", delta=f"{un_up_diff:+}")
+
+                        st.metric("Зміна % Голови", f"{old_head_pct:.2f}% ➔ {curr_head_pct:.2f}%",
+                                  delta=f"{head_diff:+.2f}%")
+
+                    col_d1, col_d3, col_d7, col_d30 = st.columns(4)
                     with col_d1:
                         build_delta_col("За 1 День", 1)
+                    with col_d3:
+                        build_delta_col("За 3 Дні", 3)
                     with col_d7:
                         build_delta_col("За 7 Днів (Тиждень)", 7)
                     with col_d30:
@@ -1298,107 +1600,17 @@ def main():
 
     # ---------------- РЕЖИМ 4: 🛡️ КЛАНОВІ МЕТРИКИ (ТІЛЬКИ АДМІН) ----------------
     elif mode == "🛡️ Кланові метрики" and is_admin:
-        st.subheader("🛡️ Клановий менеджмент & Конструктор Загонів")
+        avg_val = AnalyticsEngine.calculate_clan_avg_grenades(
+            db, active_nicks, st.session_state.get("live_stats")
+        )
+        delta_val = 0
 
-        if not active_nicks:
-            st.warning("⚠️ Спочатку оберіть блок/клан у сайдбарі для формування загону!")
-            return
+        st.session_state["avg_grenades_val"] = avg_val
+        st.session_state["grenades_delta"] = delta_val
 
-        clan_tabs = st.tabs(["⚔️ Конструктор загонів (Squad Builder)", "📊 Загальні метрики клану"])
-
-        with clan_tabs[0]:
-            st.markdown("### 🪖 Моделювання бойового загону")
-
-            saved_squads = db.get_squads(selected_group)
-            col_sq_1, col_sq_2 = st.columns([1, 2])
-
-            with col_sq_1:
-                if saved_squads:
-                    st.markdown("**📂 Збережені загони:**")
-                    load_squad_name = st.selectbox("Завантажити загін",
-                                                   options=["-- Новий загін --"] + list(saved_squads.keys()))
-                    if load_squad_name != "-- Новий загін --":
-                        sq_info = saved_squads[load_squad_name]
-                        init_squad_name = load_squad_name
-                        init_slots = sq_info["max_slots"]
-                        init_members = [m for m in sq_info["members"] if m in active_nicks]
-                    else:
-                        init_squad_name = "Загін Alpha"
-                        init_slots = 5
-                        init_members = []
-                else:
-                    init_squad_name = "Загін Alpha"
-                    init_slots = 5
-                    init_members = []
-
-                squad_name = st.text_input("Назва загону / Пачки", value=init_squad_name)
-                max_slots = st.number_input("Кількість місць у загоні", min_value=1, max_value=30, value=init_slots)
-
-                selected_squad_members = st.multiselect(
-                    f"Оберіть бійців з блоку '{selected_group}':",
-                    options=sorted(active_nicks),
-                    default=init_members,
-                    max_selections=int(max_slots)
-                )
-
-                col_sq_b1, col_sq_b2 = st.columns(2)
-                with col_sq_b1:
-                    if st.button("💾 Зберегти загін", width='stretch'):
-                        if squad_name and selected_squad_members:
-                            db.save_squad(squad_name, selected_group, max_slots, selected_squad_members)
-                            st.success(f"Загін '{squad_name}' збережено!")
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error("Вкажіть назву та виберіть гравців!")
-
-                with col_sq_b2:
-                    if saved_squads and squad_name in saved_squads:
-                        if st.button("🗑️ Видалити", type="secondary", width='stretch'):
-                            db.delete_squad(squad_name)
-                            st.warning(f"Загін '{squad_name}' видалено!")
-                            time.sleep(1)
-                            st.rerun()
-
-            with col_sq_2:
-                if not selected_squad_members:
-                    st.info("👈 Виберіть бійців ліворуч, щоб вирахувати параметри загону.")
-                else:
-                    squad_tp_list = []
-                    squad_details = []
-
-                    for nick in selected_squad_members:
-                        curr = st.session_state.live_stats.get(nick, db.get_historical_snapshot(nick, 0))
-                        tp = AnalyticsEngine.calc_tp(curr) if curr else 0.0
-
-                        tier = AnalyticsEngine.get_tier_letter(tp)
-                        squad_tp_list.append(tp)
-
-                        squad_details.append({
-                            "Нікнейм": nick,
-                            "Тир": tier,
-                            "Total Power (ТР)": tp,
-                            "K/D": AnalyticsEngine.calc_ratio(curr.get("kills", 0),
-                                                              max(curr.get("deaths", 0), 1)) if curr else 0.0
-                        })
-
-                    total_squad_tp = round(sum(squad_tp_list), 1)
-                    avg_squad_tp = round(total_squad_tp / len(squad_tp_list), 1) if squad_tp_list else 0.0
-                    avg_squad_tier = AnalyticsEngine.get_tier_letter(avg_squad_tp)
-
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("🔥 Загальна потужність", total_squad_tp)
-                    m2.metric("📊 Середній ТР бійця", avg_squad_tp)
-                    m3.metric("🎖️ Усереднений тир", avg_squad_tier)
-                    m4.metric("👥 Укомплектованість", f"{len(selected_squad_members)} / {max_slots}")
-
-                    st.markdown("#### 📜 Склад загону:")
-                    df_squad = pd.DataFrame(squad_details)
-                    st.dataframe(df_squad, width='stretch')
-
-        with clan_tabs[1]:
-            st.info("💡 У цьому розділі незабаром з'являться порівняльні таблиці між різними кланами та детальна аналітика відвідуваності КВ.")
+        render_clan_metrics_tab(db, selected_group, active_nicks)
 
 
 if __name__ == "__main__":
     main()
+    
