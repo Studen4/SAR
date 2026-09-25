@@ -1160,7 +1160,7 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                 st.session_state.temp_extracted_nicks = [a.strip() for a in att_str.splitlines() if a.strip()]
                 st.session_state.editing_date_for_nicks = edit_date
 
-            # 2. АВТОМАШИЧНЕ ЗАСТОСУВАННЯ ШІ-СКАНУВАННЯ (якщо немає конфліктів із низьким ТР)
+            # 2. АВТОМАТИЧНЕ ЗАСТОСУВАННЯ ШІ-СКАНУВАННЯ
             if f"pending_ai_{edit_date}" in st.session_state:
                 ai_data = st.session_state[f"pending_ai_{edit_date}"]
                 if not ai_data.get("low_tp"):
@@ -1168,7 +1168,11 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                     st.session_state[f"online_{edit_date}"] = popped_ai["online"]
                     st.session_state[f"enemies_{edit_date}"] = popped_ai["enemies"]
                     st.session_state[f"results_{edit_date}"] = popped_ai["results"]
+
+                    # Оновлюємо і тимчасовий список, і безпосередньо ключ віджета multiselect:
                     st.session_state.temp_extracted_nicks = popped_ai["nicks"]
+                    st.session_state["ms_extracted_nicks"] = popped_ai["nicks"]
+
                     st.session_state.editing_date_for_nicks = edit_date
                     st.success(f"✅ Сканування завершено! Витягнуто гравців: {len(popped_ai['nicks'])}")
 
@@ -1267,10 +1271,13 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
             if st.session_state.get("temp_extracted_nicks") is not None:
                 st.markdown("#### 📋 Список витягнутих нікнеймів наших бійців:")
 
+                # Якщо ключ ще не ініціалізовано у сесії, задаємо його
+                if "ms_extracted_nicks" not in st.session_state:
+                    st.session_state["ms_extracted_nicks"] = st.session_state.temp_extracted_nicks
+
                 edited_nicks = st.multiselect(
                     "Ви можете відкоригувати список присутніх бійців вручну:",
                     options=sorted(list(set(active_nicks + st.session_state.temp_extracted_nicks))),
-                    default=st.session_state.temp_extracted_nicks,
                     key="ms_extracted_nicks"
                 )
                 st.session_state.temp_extracted_nicks = edited_nicks
@@ -1296,6 +1303,7 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                               f"enemies_{edit_date}", f"results_{edit_date}", f"tabs_{edit_date}",
                               f"enemy_tabs_{edit_date}", f"replays_{edit_date}", f"comments_{edit_date}"]:
                         st.session_state.pop(k, None)
+                    st.session_state.pop("ms_extracted_nicks", None)
                     st.session_state.pop("temp_extracted_nicks", None)
                     st.session_state.pop("editing_date_for_nicks", None)
                     st.session_state.active_edit_date = None
@@ -1309,6 +1317,7 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                               f"enemies_{edit_date}", f"results_{edit_date}", f"tabs_{edit_date}",
                               f"enemy_tabs_{edit_date}", f"replays_{edit_date}", f"comments_{edit_date}"]:
                         st.session_state.pop(k, None)
+                    st.session_state.pop("ms_extracted_nicks", None)
                     st.session_state.pop("temp_extracted_nicks", None)
                     st.session_state.pop("editing_date_for_nicks", None)
                     st.session_state.active_edit_date = None

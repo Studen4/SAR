@@ -521,14 +521,24 @@ class DatabaseManager:
             conn.commit()
 
     def save_snapshot(self, snapshot_type: str, stats: dict, custom_timestamp: str = None):
-        """Зберігає або перезаписує зріз для конкретного гравця та типу зрізу."""
+        """Зберігає зріз. Для 00:00 зберігає історію по днях, для КВ — перезаписує поточний день."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            # Гарантуємо, що для одного і того ж типу зрізу і гравця не буде дублікатів
-            cursor.execute(
-                "DELETE FROM daily_snapshots WHERE snapshot_type = ? AND nickname = ?",
-                (snapshot_type, stats["nickname"])
-            )
+
+            if snapshot_type == "00:00":
+                # Для 00:00 видаляємо дублікати ТІЛЬКИ ЗА СЬОГОДНІШНІЙ ДЕНЬ (щоб не було 2 записів за один день)
+                today_date = (datetime.datetime.now(KYIV_TZ)).strftime('%Y-%m-%d')
+                cursor.execute("""
+                    DELETE FROM daily_snapshots 
+                    WHERE snapshot_type = '00:00' AND nickname = ? AND DATE(timestamp) = ?
+                """, (stats["nickname"], today_date))
+            else:
+                # Для КВ-зрізів (21:00, CW_END, CUSTOM) перезаписуємо старий зріз
+                cursor.execute("""
+                    DELETE FROM daily_snapshots 
+                    WHERE snapshot_type = ? AND nickname = ?
+                """, (snapshot_type, stats["nickname"]))
+
             if custom_timestamp:
                 cursor.execute("""
                     INSERT INTO daily_snapshots 
@@ -605,15 +615,15 @@ def run_background_scheduler():
                 api_client = StalzoneApiClient(API_CLIENT_ID, API_CLIENT_SECRET, "EU")
 
                 if hour == 0 and minute == 0 and (today_str, "00:00") not in executed_tasks:
-                    logger.info("⏰ [SCHEDULE] Виконання зрізу 00:00...")
-                    db.clear_daily_data("00:00")
+                    logger.info("⏰ [SCHEDULE] Виконання щоденного зрізу 00:00 (збереження в історію)...")
+                    # db.clear_daily_data("00:00")  <-- ЦЕЙ РЯДОК ПОТРІБНО ВИДАЛИТИ/ЗАКОМЕНТУВАТИ
                     for g_name, g_nicks in sorted_groups:
                         for nick in g_nicks:
                             stats = api_client.fetch_player_stats(nick)
                             if stats.get("status") == "OK":
                                 db.save_snapshot("00:00", stats)
                     executed_tasks[(today_str, "00:00")] = True
-                    logger.info("✅ [SCHEDULE] Зріз 00:00 завершено.")
+                    logger.info("✅ [SCHEDULE] Зріз 00:00 збережено в історію БД.")
 
                 cw_blocks_str = db.get_setting("cw_scan_blocks", "")
                 cw_blocks = json.loads(cw_blocks_str) if cw_blocks_str else []
@@ -1331,7 +1341,7 @@ def main():
         df_pre = pd.DataFrame(act_rows)
         st.dataframe(df_pre, width='stretch', height=450)
 
-    # ---------------- РЕЖИМ 2: ЗРІЗ (АНАЛІТИКА) ----------------
+        # ---------------- РЕЖИМ 2: ЗРІЗ (АНАЛІТИКА) ----------------
     elif mode in ["⚔️ Після КВ \\ Зріз (Аналітика)", "⚔️ Зріз (аналітика)"]:
         if not active_nicks:
             st.info("👈 Оберіть або створіть блок гравців у панелі ліворуч.")
@@ -1355,7 +1365,11 @@ def main():
         elif is_tracking_active:
             st.warning("⏳ **Зріз у процесі!** Натисніть 🛑 Кінець в сайдбарі після закінчення.")
         else:
-            st.info("⚔️ Відображається статистика за наявними даними КВ.")
+            if not snap_21:
+                st.warning(
+                    "⏳ **Зріз 21:00 ще не зафіксовано в базі.** Аналітика КВ буде доступна після 21:00 (або після збереження зрізу 21:00).")
+            else:
+                st.info("⚔️ Відображається статистика за наявними даними КВ.")
 
         rows = []
         use_custom = (analytics_source == "⏱️ Ручний зріз") and is_custom_complete
@@ -1365,15 +1379,22 @@ def main():
                 start = st.session_state.custom_start.get(nick, {})
                 end = st.session_state.custom_end.get(nick, {})
             else:
-                start = snap_21.get(nick, snap_00.get(nick, {}))
-                end = st.session_state.live_stats.get(nick, snap_cw.get(nick, {}))
+                # КРИТИЧНЕ ВИПРАВЛЕННЯ: Для КВ використовуємо СТРОГО snap_21 (БЕЗ фолбеку на 00:00)
+                start = snap_21.get(nick, {})
+
+                # Якщо КВ завершено і є фіксований snap_cw — беремо його. Якщо КВ іде — беремо live_stats.
+                if snap_cw:
+                    end = snap_cw.get(nick, {})
+                else:
+                    end = st.session_state.live_stats.get(nick, {})
 
             if not start or not end:
+                status_text = "Очікування 21:00" if not start else "Очікування кінця КВ"
                 rows.append({
                     "Нік": nick,
                     "ТР за період": 0.0,
                     "Різниця з загальним (%)": 0.0,
-                    "Настріл (У/С/П)": "Немає даних",
+                    "Настріл (У/С/П)": status_text,
                     "У/С": 0.0,
                     "УП/С": 0.0,
                     "Гранат": 0,
