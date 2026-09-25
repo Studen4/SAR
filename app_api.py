@@ -521,8 +521,14 @@ class DatabaseManager:
             conn.commit()
 
     def save_snapshot(self, snapshot_type: str, stats: dict, custom_timestamp: str = None):
+        """Зберігає або перезаписує зріз для конкретного гравця та типу зрізу."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            # Гарантуємо, що для одного і того ж типу зрізу і гравця не буде дублікатів
+            cursor.execute(
+                "DELETE FROM daily_snapshots WHERE snapshot_type = ? AND nickname = ?",
+                (snapshot_type, stats["nickname"])
+            )
             if custom_timestamp:
                 cursor.execute("""
                     INSERT INTO daily_snapshots 
@@ -600,6 +606,7 @@ def run_background_scheduler():
 
                 if hour == 0 and minute == 0 and (today_str, "00:00") not in executed_tasks:
                     logger.info("⏰ [SCHEDULE] Виконання зрізу 00:00...")
+                    db.clear_daily_data("00:00")
                     for g_name, g_nicks in sorted_groups:
                         for nick in g_nicks:
                             stats = api_client.fetch_player_stats(nick)
@@ -613,24 +620,31 @@ def run_background_scheduler():
                 if not cw_blocks and sorted_groups:
                     cw_blocks = [sorted_groups[0][0]]
 
+                # --- ПОЧАТОК НОВОГО КВ ЦИКЛУ (20:59 / 21:00) ---
                 if hour == 20 and minute == 59 and (today_str, "21:00") not in executed_tasks:
-                    logger.info("⏰ [SCHEDULE] Виконання КВ зрізу 21:00 (запуск 20:59)...")
+                    logger.info("⏰ [SCHEDULE] Запуск нового КВ циклу: очищення старих КВ зрізів і збір 21:00...")
+                    # Очищаємо попередні зрізи КВ (21:00 та CW_END), щоб почати новий день начисто
+                    db.clear_daily_data("21:00")
+                    db.clear_daily_data("CW_END")
+                    db.clear_daily_data("CUSTOM_START")
+                    db.clear_daily_data("CUSTOM_END")
+
                     for g_name in cw_blocks:
                         if g_name in groups:
                             for nick in groups[g_name]:
                                 stats = api_client.fetch_player_stats(nick)
                                 if stats.get("status") == "OK":
                                     db.save_snapshot("21:00", stats)
-                    db.clear_daily_data("CUSTOM_START")
-                    db.clear_daily_data("CUSTOM_END")
                     executed_tasks[(today_str, "21:00")] = True
-                    logger.info("✅ [SCHEDULE] Зріз 21:00 завершено.")
+                    logger.info("✅ [SCHEDULE] Новий зріз 21:00 успішно збережено!")
 
                 target_cw_total_mins = target_cw_hour * 60 + target_cw_min - 1
                 curr_total_mins = hour * 60 + minute
 
+                # --- КІНЕЦЬ КВ ЦИКЛУ (CW_END) ---
                 if curr_total_mins == target_cw_total_mins and (today_str, "CW_END") not in executed_tasks:
                     logger.info(f"⏰ [SCHEDULE] Виконання зрізу CW_END (запуск о {hour}:{minute:02d})...")
+                    db.clear_daily_data("CW_END")
                     for g_name in cw_blocks:
                         if g_name in groups:
                             for nick in groups[g_name]:
@@ -638,9 +652,9 @@ def run_background_scheduler():
                                 if stats.get("status") == "OK":
                                     db.save_snapshot("CW_END", stats)
                     executed_tasks[(today_str, "CW_END")] = True
-                    logger.info("✅ [SCHEDULE] Зріз CW_END завершено.")
+                    logger.info("✅ [SCHEDULE] Зріз CW_END завершено. Статистика актуальна до наступного КВ.")
 
-            # --- АВТОМАТИЧНЕ ЗБЕРЕЖЕННЯ ТА ПЕРЕДАЧА НА GOOGLE DRIVE О 23:00 ЗА КИЄВОМ ---
+            # --- АВТОМАТИЧНЕ ЗБЕРЕЖЕННЯ ТА ПЕРЕДАЧА НА GOOGLE DRIVE О 23:00 ZA КИЄВОМ ---
             if hour == 23 and minute == 0 and (today_str, "23:00_DRIVE") not in executed_tasks:
                 logger.info("⏰ [SCHEDULE] Запуск автоматичного збереження та передачі БД на Google Drive (23:00 Kyiv)...")
                 if upload_db_to_drive():
@@ -1100,28 +1114,31 @@ def main():
                     elif not st.session_state.live_stats:
                         st.warning("Спочатку отримайте дані!")
                     else:
+                        db.clear_daily_data("00:00")
                         for nick in active_nicks:
                             if nick in st.session_state.live_stats:
                                 db.save_snapshot("00:00", st.session_state.live_stats[nick])
-                        st.success("✅ Зріз 00:00 збережено!")
+                        st.success("✅ Зріз 00:00 збережено (старий перезаписано)!")
                         time.sleep(1)
                         st.rerun()
 
-                if st.button("📸 Записати 21:00", width='stretch'):
+                if st.button("📸 Записати 21:00 (Новий КВ цикл)", width='stretch'):
                     if not active_nicks:
                         st.error("Оберіть блок гравців у списку вище!")
                     elif not st.session_state.live_stats:
                         st.warning("Спочатку отримайте дані!")
                     else:
-                        for nick in active_nicks:
-                            if nick in st.session_state.live_stats:
-                                db.save_snapshot("21:00", st.session_state.live_stats[nick])
-
+                        # Початок нового КВ циклу: очищаємо старий 21:00 та старий CW_END
+                        db.clear_daily_data("21:00")
+                        db.clear_daily_data("CW_END")
                         db.clear_daily_data("CUSTOM_START")
                         db.clear_daily_data("CUSTOM_END")
                         st.session_state.custom_start = {}
                         st.session_state.custom_end = {}
-                        st.success("✅ Зріз 21:00 збережено!")
+                        for nick in active_nicks:
+                            if nick in st.session_state.live_stats:
+                                db.save_snapshot("21:00", st.session_state.live_stats[nick])
+                        st.success("✅ Зріз 21:00 збережено! Новий КВ цикл розпочато.")
                         time.sleep(1)
                         st.rerun()
 
@@ -1131,10 +1148,11 @@ def main():
                     elif not st.session_state.live_stats:
                         st.warning("Спочатку отримайте дані!")
                     else:
+                        db.clear_daily_data("CW_END")
                         for nick in active_nicks:
                             if nick in st.session_state.live_stats:
                                 db.save_snapshot("CW_END", st.session_state.live_stats[nick])
-                        st.success("✅ Зріз кінця КВ (CW_END) збережено!")
+                        st.success("✅ Зріз кінця КВ (CW_END) збережено (старий перезаписано)!")
                         time.sleep(1)
                         st.rerun()
 
@@ -1337,7 +1355,7 @@ def main():
         elif is_tracking_active:
             st.warning("⏳ **Зріз у процесі!** Натисніть 🛑 Кінець в сайдбарі після закінчення.")
         else:
-            st.info("⚔️ Відображається статистика за наявними даними.")
+            st.info("⚔️ Відображається статистика за наявними даними КВ.")
 
         rows = []
         use_custom = (analytics_source == "⏱️ Ручний зріз") and is_custom_complete
@@ -1613,4 +1631,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
