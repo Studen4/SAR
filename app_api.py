@@ -664,14 +664,19 @@ def run_background_scheduler():
                     executed_tasks[(today_str, "CW_END")] = True
                     logger.info("✅ [SCHEDULE] Зріз CW_END завершено. Статистика актуальна до наступного КВ.")
 
-            # --- АВТОМАТИЧНЕ ЗБЕРЕЖЕННЯ ТА ПЕРЕДАЧА НА GOOGLE DRIVE О 23:00 ZA КИЄВОМ ---
-            if hour == 23 and minute == 0 and (today_str, "23:00_DRIVE") not in executed_tasks:
-                logger.info("⏰ [SCHEDULE] Запуск автоматичного збереження та передачі БД на Google Drive (23:00 Kyiv)...")
-                if upload_db_to_drive():
-                    executed_tasks[(today_str, "23:00_DRIVE")] = True
-                    logger.info("✅ [SCHEDULE] Резервну копію БД успішно відправлено на Google Drive!")
-                else:
-                    logger.error("❌ [SCHEDULE] Помилка відправки резервної копії БД на Google Drive.")
+            # --- АВТОМАТИЧНЕ ЗБЕРЕЖЕННЯ ТА ПЕРЕДАЧА НА GOOGLE DRIVE О 23:00 ТА 00:30 ЗА КИЄВОМ ---
+            if (hour == 23 and minute == 0) or (hour == 0 and minute == 30):
+                time_str = f"{hour:02d}:{minute:02d}"
+                task_key = f"{time_str}_DRIVE"
+
+                if (today_str, task_key) not in executed_tasks:
+                    logger.info(
+                        f"⏰ [SCHEDULE] Запуск автоматичного збереження та передачі БД на Google Drive ({time_str} Kyiv)...")
+                    if upload_db_to_drive():
+                        executed_tasks[(today_str, task_key)] = True
+                        logger.info(f"✅ [SCHEDULE] Резервну копію БД успішно відправлено на Google Drive ({time_str})!")
+                    else:
+                        logger.error(f"❌ [SCHEDULE] Помилка відправки резервної копії БД на Google Drive ({time_str}).")
 
             cutoff = (now_kyiv - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
             for key in list(executed_tasks.keys()):

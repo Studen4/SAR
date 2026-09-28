@@ -332,6 +332,56 @@ def init_clan_db(db):
         """)
         conn.commit()
 
+def init_activities_db(db):
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS clan_activities (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                date TEXT,
+                online_count INTEGER,
+                duration_hours REAL,
+                total_amount REAL,
+                treasury_percent REAL,
+                treasury_amount REAL,
+                players_data TEXT
+            )
+        """)
+        conn.commit()
+
+def get_all_activities(db):
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM clan_activities ORDER BY date DESC, id DESC")
+        rows = cursor.fetchall()
+        activities = []
+        for r in rows:
+            activities.append({
+                "id": r[0], "name": r[1], "date": r[2], "online_count": r[3],
+                "duration_hours": r[4], "total_amount": r[5], "treasury_percent": r[6],
+                "treasury_amount": r[7], "players_data": json.loads(r[8] if r[8] else "{}")
+            })
+        return activities
+
+def save_clan_activity(db, data: dict):
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO clan_activities 
+            (id, name, date, online_count, duration_hours, total_amount, treasury_percent, treasury_amount, players_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name, date=excluded.date, online_count=excluded.online_count,
+                duration_hours=excluded.duration_hours, total_amount=excluded.total_amount,
+                treasury_percent=excluded.treasury_percent, treasury_amount=excluded.treasury_amount,
+                players_data=excluded.players_data
+        """, (
+            data["id"], data["name"], data["date"], data["online_count"],
+            data["duration_hours"], data["total_amount"], data["treasury_percent"],
+            data["treasury_amount"], json.dumps(data["players_data"])
+        ))
+        conn.commit()
 
 def clear_all_clan_squads(db, group_name: str):
     """Очищення всіх збережених отрядів та скидання номерів отрядів для клану."""
@@ -680,6 +730,7 @@ def move_player_to_squad_db(db, group_name: str, player: str, target_o_num: int,
 # ==========================================
 def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=AnalyticsEngine):
     init_clan_db(db)
+    init_activities_db(db)
 
     st.markdown("""
     <style>
@@ -709,6 +760,7 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
         "⚔️ Редактор отрядів (Squad Builder)",
         "📌 Активний склад (Статус отрядів)",
         "📅 Робоча зона (Workspace)",
+        "💰 Активності",
         "📊 Загальні метрики клану"
     ])
 
@@ -1500,9 +1552,226 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                                     unsafe_allow_html=True)
 
     # ---------------------------------------------------------
-    # Вкладка 4: ЗАГАЛЬНІ МЕТРИКИ КЛАНУ (ГЛОБАЛЬНА СТАТИСТИКА)
+    # Вкладка 4: АКТИВНОСТІ (Фарм, виноси, тощо)
     # ---------------------------------------------------------
     with clan_tabs[3]:
+        # Ініціалізація стану калькулятора та редагування
+        if "act_total_sum" not in st.session_state:
+            st.session_state.act_total_sum = 0.0
+        if "act_edit_id" not in st.session_state:
+            st.session_state.act_edit_id = None
+
+        # Зміна пропорцій колонок для кращого вигляду таблиці
+        col_act_left, col_act_right = st.columns([1.4, 1])
+
+        with col_act_right:
+            st.markdown("#### 🏆 Список останніх активностей")
+
+            # Кнопка створення з новим синтаксисом width='stretch'
+            if st.button("➕ Створити нову активність", type="primary", width='stretch'):
+                st.session_state.act_edit_id = None
+                st.session_state.act_total_sum = 0.0
+                # Очищаємо дані попередніх розрахунків
+                for key in list(st.session_state.keys()):
+                    if key.startswith("act_t_") or key.startswith("act_p_") or key.startswith("act_m_"):
+                        del st.session_state[key]
+                st.rerun()
+
+            all_acts = get_all_activities(db)
+
+            if not all_acts:
+                st.info("Ще немає збережених активностей.")
+            else:
+                # Сортуємо за датою (від новіших до старіших)
+                top_10 = sorted(all_acts, key=lambda x: x["date"], reverse=True)[:10]
+
+                for act in top_10:
+                    with st.container(border=True):
+                        c1, c2 = st.columns([4, 1])
+                        with c1:
+                            st.markdown(f"**{act['name']}**")
+                            st.caption(
+                                f"🏦 У казну: **{act['treasury_amount']:,.0f}** | 👥 {act['online_count']}")
+                        with c2:
+                            if st.button("✏️", key=f"edit_act_{act['id']}", help="Редагувати"):
+                                st.session_state.act_edit_id = act['id']
+                                st.session_state.act_total_sum = act['total_amount']
+                                st.rerun()
+
+        with col_act_left:
+            # Назва та дата в один рядок для економії місця
+            col_name, col_date = st.columns(2)
+            with col_name:
+                current_date_str = datetime.now().strftime("%Y-%m-%d")
+                default_name = f"Активність {current_date_str}"
+                act_name = st.text_input("Назва активності", value=default_name, key="act_name",
+                                         label_visibility="collapsed")
+            with col_date:
+                act_date = st.date_input("Дата", value=datetime.now(), key="act_date",
+                                         label_visibility="collapsed")
+
+            st.markdown("##### 👥 Виберіть гравців з блоку")
+            act_players = st.multiselect(
+                "Учасники",
+                options=sorted(active_nicks),
+                key="act_players",
+                label_visibility="collapsed"
+            )
+
+            st.markdown("---")
+
+            # Розділення: Ліворуч таблиця, Праворуч калькулятор
+            c_table, c_settings = st.columns([1.2, 1])
+
+            with c_settings:
+                st.markdown("##### Загальна сума:")
+                st.markdown(
+                    f"<h3 style='margin-top: 0; padding-top: 0;'>{st.session_state.act_total_sum:,.0f}</h3>",
+                    unsafe_allow_html=True)
+
+                # Компактний блок вводу + і -
+                calc_col1, calc_col2, calc_col3 = st.columns([2, 1, 1])
+                with calc_col1:
+                    calc_input = st.number_input("Ввід", value=0.0, step=1000.0,
+                                                 label_visibility="collapsed")
+                with calc_col2:
+                    if st.button("➕", width='stretch', key="add_btn"):
+                        st.session_state.act_total_sum += calc_input
+                        st.rerun()
+                with calc_col3:
+                    if st.button("➖", width='stretch', key="sub_btn"):
+                        st.session_state.act_total_sum -= calc_input
+                        st.rerun()
+
+                st.markdown("##### Одиниці часу:")
+                time_unit = st.radio("Одиниці", options=["Хвилини", "Години"], horizontal=True,
+                                     label_visibility="collapsed")
+
+                # Введення глобального часу активності
+                st.markdown("##### ⏱️ Глобальний час активності:")
+                act_global_duration = st.number_input(
+                    "Глобальний час",
+                    min_value=0.0,
+                    value=0.0,
+                    step=10.0,
+                    help="Вкажіть загальну тривалість всієї активності. Якщо залишити 0, відсоток буде рахуватися від суми часу всіх присутніх учасників.",
+                    label_visibility="collapsed"
+                )
+
+                st.markdown("##### Відсоток на казну:")
+                act_treasury_pct = st.number_input("Відсоток (0-100%)", min_value=0.0, max_value=100.0,
+                                                   value=10.0, step=1.0, label_visibility="collapsed")
+
+                treasury_amount = st.session_state.act_total_sum * (act_treasury_pct / 100)
+                pool_amount = st.session_state.act_total_sum - treasury_amount
+
+                # Казна та пул на одному рівні
+                tc1, tc2 = st.columns(2)
+                with tc1:
+                    st.info(f"🏦 Казна:\n\n**{treasury_amount:,.0f}**")
+                with tc2:
+                    st.success(f"💰 Пул:\n\n**{pool_amount:,.0f}**")
+
+            with c_table:
+                # Генерація даних для таблиці
+                df_data = []
+                for p in act_players:
+                    t_val = st.session_state.get(f"act_t_{p}", 0.0)
+                    pct_val = st.session_state.get(f"act_p_{p}", "0.0%")
+                    money_val = st.session_state.get(f"act_m_{p}", 0.0)
+                    df_data.append({
+                        "Нікнейм": p,
+                        "⏱️ Час": t_val,
+                        "%": pct_val,
+                        "$ Виплата": f"{money_val:,.0f}"
+                    })
+
+                df = pd.DataFrame(df_data)
+
+                if not df.empty:
+                    edited_df = st.data_editor(
+                        df,
+                        disabled=["Нікнейм", "%", "$ Виплата"],
+                        hide_index=True,
+                        width='stretch',
+                        key="act_table_editor"
+                    )
+
+                    # Зберігаємо введені значення часу
+                    for idx, row in edited_df.iterrows():
+                        st.session_state[f"act_t_{row['Нікнейм']}"] = row["⏱️ Час"]
+
+                    if st.button("🧮 Розрахувати долю", width='stretch'):
+                        total_time_participants = edited_df["⏱️ Час"].sum()
+
+                        # Визначення базового часу для розрахунку відсотка участі
+                        base_time = act_global_duration if act_global_duration > 0 else total_time_participants
+
+                        for idx, row in edited_df.iterrows():
+                            p_name = row['Нікнейм']
+                            p_time = row['⏱️ Час']
+
+                            # Розрахунок відсотка участі відносно глобального (або сумарного) часу
+                            p_pct = (p_time / base_time * 100) if base_time > 0 else 0
+
+                            # Розподіл грошового пулу між присутніми бійцями
+                            p_share_in_pool = (
+                                        p_time / total_time_participants) if total_time_participants > 0 else 0
+                            p_money = pool_amount * p_share_in_pool
+
+                            st.session_state[f"act_p_{p_name}"] = f"{p_pct:.1f}%"
+                            st.session_state[f"act_m_{p_name}"] = p_money
+                        st.rerun()
+                else:
+                    st.caption("Оберіть учасників зверху, щоб з'явилася таблиця розрахунку.")
+
+            # Кнопка збереження
+            st.markdown("---")
+            _, col_save, _ = st.columns([1, 2, 1])
+            with col_save:
+                if st.button("💾 Зберегти день / активність", type="primary", width='stretch'):
+                    if not act_players:
+                        st.error("Додайте хоча б одного учасника!")
+                    else:
+                        players_data_to_save = {}
+                        total_h = 0.0
+                        for p in act_players:
+                            t = st.session_state.get(f"act_t_{p}", 0.0)
+                            m = st.session_state.get(f"act_m_{p}", 0.0)
+                            pct_str = st.session_state.get(f"act_p_{p}", "0.0%")
+                            pct_float = float(pct_str.strip('%')) if pct_str != "0.0%" else 0.0
+
+                            h_time = t / 60.0 if time_unit == "Хвилини" else t
+                            total_h += h_time
+
+                            players_data_to_save[p] = {
+                                "time": t,
+                                "percent": pct_float,
+                                "payout": m
+                            }
+
+                        act_id = st.session_state.act_edit_id or f"act_{int(time.time())}"
+                        save_clan_activity(db, {
+                            "id": act_id,
+                            "name": act_name,
+                            "date": act_date.strftime("%Y-%m-%d"),
+                            "online_count": len(act_players),
+                            "duration_hours": total_h,
+                            "total_amount": st.session_state.act_total_sum,
+                            "treasury_percent": act_treasury_pct,
+                            "treasury_amount": treasury_amount,
+                            "players_data": players_data_to_save
+                        })
+                        st.success("Успішно збережено!")
+                        st.session_state.act_edit_id = None
+                        st.session_state.act_total_sum = 0.0
+                        time.sleep(0.5)
+                        st.rerun()
+
+    # ---------------------------------------------------------
+    # Вкладка 5: ЗАГАЛЬНІ МЕТРИКИ КЛАНУ (ГЛОБАЛЬНА СТАТИСТИКА)
+    # ---------------------------------------------------------
+    with clan_tabs[4]:
         c_head, c_select = st.columns([2.5, 1])
         with c_head:
             st.markdown("### 📊 Загальні глобальні метрики клану")
@@ -1604,6 +1873,17 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
             att_players = [p.strip() for p in ev.get("attendance_list", "").split("\n") if p.strip()]
             for p in att_players:
                 attendance_counter[p] += 1
+
+        all_activities = get_all_activities(db)
+        if sorted_dates:  # Використовуємо той самий latest_date що й для КВ
+            for act in all_activities:
+                try:
+                    act_date = datetime.strptime(act["date"], "%Y-%m-%d").date()
+                    if (latest_date - act_date).days < period_days:
+                        for p_name in act["players_data"].keys():
+                            attendance_counter[p_name] += 1
+                except ValueError:
+                    continue
 
             # ВИПРАВЛЕНИЙ БЛОК: Пошук найбільшої перемоги безпосередньо з рядків results
             for line in res_text.splitlines():
