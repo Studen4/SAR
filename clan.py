@@ -394,11 +394,22 @@ def clear_all_clan_squads(db, group_name: str):
     """Очищення всіх збережених отрядів та скидання номерів отрядів для клану."""
     with db.get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("UPDATE player_equip SET otryad_num = 0 WHERE group_name = ?", (group_name,))
+        # 1. Скидаємо номер отряду для клану, а також для записів із порожнім/NULL group_name
+        cursor.execute("""
+            UPDATE player_equip 
+            SET otryad_num = 0 
+            WHERE group_name = ? OR group_name = '' OR group_name IS NULL
+        """, (group_name,))
         cursor.execute("DELETE FROM squad_titles WHERE group_name = ?", (group_name,))
         conn.commit()
+
+    # 2. Повністю очищаємо збережені пачки у БД
     if hasattr(db, "clear_squads"):
         db.clear_squads(group_name)
+    if hasattr(db, "get_squads") and hasattr(db, "delete_squad"):
+        saved_sqs = db.get_squads(group_name)
+        for sq_name in list(saved_sqs.keys()):
+            db.delete_squad(sq_name)
 
 
 def get_player_equip(db, nickname: str) -> dict:
@@ -797,6 +808,9 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                     try:
                         df_csv = pd.read_csv(uploaded_csv)
                         if "Нікнейм" in df_csv.columns:
+                            # 1. Очищаємо всі застарілі пачки клану перед збереженням нових з CSV
+                            clear_all_clan_squads(db, selected_group)
+
                             squad_members_map = {}
                             squad_titles_map = {}
 
@@ -828,7 +842,8 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                                         auto_num_counter += 1
                                     o_num = title_to_num_auto[title_v]
 
-                                if not title_v or title_v == "?":
+                                # 2. Нормалізація назви отряду (якщо назва є просто числом або порожня)
+                                if not title_v or title_v == "?" or title_v.isdigit():
                                     title_v = f"Отряд {o_num}" if o_num > 0 else "Резерв"
 
                                 save_player_equip(db, n_nick, selected_group, {
@@ -887,7 +902,7 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                     sn_rif = st.text_input("Снайперська г.", value=p_eq.get("sniper_rifle", "?"), key="sn_rif")
                 with eq_c3:
                     build_val = st.text_input("Збірка", value=p_eq.get("build", "?"), key="build_val")
-                    otryad_n = st.number_input("Номер отряду (0 = Резерв)", min_value=0, max_value=20,
+                    otryad_n = st.number_input("Резерв", min_value=0, max_value=20,
                                                value=int(p_eq.get("otryad_num", 0)), key="otr_num")
 
                 if st.button("💾 Оновити спорядження", width='stretch'):
