@@ -511,11 +511,18 @@ class DatabaseManager:
             cursor.execute("DELETE FROM squads WHERE squad_name = ?", (squad_name,))
             conn.commit()
 
-    def clear_daily_data(self, snapshot_type: str = None):
+    def clear_daily_data(self, snapshot_type: str = None, only_today: bool = False):
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            if snapshot_type:
+            today_date = datetime.datetime.now(KYIV_TZ).strftime('%Y-%m-%d')
+
+            if snapshot_type and only_today:
+                cursor.execute("DELETE FROM daily_snapshots WHERE snapshot_type = ? AND DATE(timestamp) = ?",
+                               (snapshot_type, today_date))
+            elif snapshot_type:
                 cursor.execute("DELETE FROM daily_snapshots WHERE snapshot_type = ?", (snapshot_type,))
+            elif only_today:
+                cursor.execute("DELETE FROM daily_snapshots WHERE DATE(timestamp) = ?", (today_date,))
             else:
                 cursor.execute("DELETE FROM daily_snapshots")
             conn.commit()
@@ -1076,12 +1083,22 @@ def main():
 
                 st.divider()
 
-                if st.button("🗑️ Скинути всі заміри", type="secondary", width='stretch'):
+                if st.button("🗑️ Видалити ВСІ зрізи (за весь час)", type="secondary", width='stretch',
+                             help="Повністю очищає всі зрізи з БД за всі дні"):
                     db.clear_daily_data()
                     st.session_state.live_stats = {}
                     st.session_state.custom_start = {}
                     st.session_state.custom_end = {}
-                    st.success("🧹 Усі зрізи успішно видалено з БД!")
+                    st.success("🧹 Усі зрізи за весь час успішно видалено з БД!")
+                    time.sleep(1)
+                    st.rerun()
+
+                if st.button("🗑️📅 Очистити зрізи за сьогодні", width='stretch',
+                             help="Видаляє зрізи тільки за поточний день, зберігаючи історію"):
+                    db.clear_daily_data(only_today=True)
+                    st.session_state.custom_start = {}
+                    st.session_state.custom_end = {}
+                    st.warning("🧹 Зрізи за сьогоднішній день успішно видалено!")
                     time.sleep(1)
                     st.rerun()
 
@@ -1129,11 +1146,10 @@ def main():
                     elif not st.session_state.live_stats:
                         st.warning("Спочатку отримайте дані!")
                     else:
-                        db.clear_daily_data("00:00")
                         for nick in active_nicks:
                             if nick in st.session_state.live_stats:
                                 db.save_snapshot("00:00", st.session_state.live_stats[nick])
-                        st.success("✅ Зріз 00:00 збережено (старий перезаписано)!")
+                        st.success("✅ Зріз 00:00 за сьогодні збережено (історію збережено)!")
                         time.sleep(1)
                         st.rerun()
 

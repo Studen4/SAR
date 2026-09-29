@@ -383,6 +383,13 @@ def save_clan_activity(db, data: dict):
         ))
         conn.commit()
 
+def delete_clan_activity(db, act_id: str):
+    """Видалення активності з бази даних за ID."""
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM clan_activities WHERE id = ?", (act_id,))
+        conn.commit()
+
 def clear_all_clan_squads(db, group_name: str):
     """Очищення всіх збережених отрядів та скидання номерів отрядів для клану."""
     with db.get_connection() as conn:
@@ -1560,6 +1567,14 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
             st.session_state.act_total_sum = 0.0
         if "act_edit_id" not in st.session_state:
             st.session_state.act_edit_id = None
+        if "act_name" not in st.session_state:
+            st.session_state["act_name"] = f"Активність {datetime.now().strftime('%Y-%m-%d')}"
+        if "act_date" not in st.session_state:
+            st.session_state["act_date"] = datetime.now().date()
+        if "act_players" not in st.session_state:
+            st.session_state["act_players"] = []
+        if "act_treasury_pct" not in st.session_state:
+            st.session_state["act_treasury_pct"] = 10.0
 
         # Зміна пропорцій колонок для кращого вигляду таблиці
         col_act_left, col_act_right = st.columns([1.4, 1])
@@ -1567,10 +1582,14 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
         with col_act_right:
             st.markdown("#### 🏆 Список останніх активностей")
 
-            # Кнопка створення з новим синтаксисом width='stretch'
+            # Кнопка створення нових даних
             if st.button("➕ Створити нову активність", type="primary", width='stretch'):
                 st.session_state.act_edit_id = None
                 st.session_state.act_total_sum = 0.0
+                st.session_state["act_name"] = f"Активність {datetime.now().strftime('%Y-%m-%d')}"
+                st.session_state["act_date"] = datetime.now().date()
+                st.session_state["act_players"] = []
+                st.session_state["act_treasury_pct"] = 10.0
                 # Очищаємо дані попередніх розрахунків
                 for key in list(st.session_state.keys()):
                     if key.startswith("act_t_") or key.startswith("act_p_") or key.startswith("act_m_"):
@@ -1582,12 +1601,11 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
             if not all_acts:
                 st.info("Ще немає збережених активностей.")
             else:
-                # Сортуємо за датою (від новіших до старіших)
                 top_10 = sorted(all_acts, key=lambda x: x["date"], reverse=True)[:10]
 
                 for act in top_10:
                     with st.container(border=True):
-                        c1, c2 = st.columns([4, 1])
+                        c1, c2, c3 = st.columns([3.2, 0.9, 0.9])
                         with c1:
                             st.markdown(f"**{act['name']}**")
                             st.caption(
@@ -1595,25 +1613,57 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                         with c2:
                             if st.button("✏️", key=f"edit_act_{act['id']}", help="Редагувати"):
                                 st.session_state.act_edit_id = act['id']
-                                st.session_state.act_total_sum = act['total_amount']
+                                st.session_state.act_total_sum = float(act.get('total_amount', 0.0))
+                                st.session_state["act_name"] = act.get('name', '')
+                                try:
+                                    st.session_state["act_date"] = datetime.strptime(act['date'], "%Y-%m-%d").date()
+                                except Exception:
+                                    st.session_state["act_date"] = datetime.now().date()
+
+                                p_data = act.get('players_data', {})
+                                p_list = list(p_data.keys())
+                                st.session_state["act_players"] = p_list
+                                st.session_state["act_treasury_pct"] = float(act.get('treasury_percent', 10.0))
+
+                                # Завантажуємо збережені розрахунки кожного гравця
+                                for p_nick, p_info in p_data.items():
+                                    if isinstance(p_info, dict):
+                                        st.session_state[f"act_t_{p_nick}"] = float(p_info.get("time", 0.0))
+                                        pct_v = p_info.get("percent", 0.0)
+                                        st.session_state[f"act_p_{p_nick}"] = f"{pct_v:.1f}%"
+                                        st.session_state[f"act_m_{p_nick}"] = float(p_info.get("payout", 0.0))
+
+                                st.rerun()
+                        with c3:
+                            if st.button("🗑️", key=f"del_act_{act['id']}", help="Видалити активність"):
+                                delete_clan_activity(db, act['id'])
+                                if st.session_state.act_edit_id == act['id']:
+                                    st.session_state.act_edit_id = None
+                                    st.session_state.act_total_sum = 0.0
+                                    st.session_state[
+                                        "act_name"] = f"Активність {datetime.now().strftime('%Y-%m-%d')}"
+                                    st.session_state["act_date"] = datetime.now().date()
+                                    st.session_state["act_players"] = []
+                                    st.session_state["act_treasury_pct"] = 10.0
+                                    for key in list(st.session_state.keys()):
+                                        if key.startswith("act_t_") or key.startswith("act_p_") or key.startswith(
+                                                "act_m_"):
+                                            del st.session_state[key]
+                                st.toast("🗑️ Активність видалено!", icon="🗑️")
                                 st.rerun()
 
         with col_act_left:
-            # Назва та дата в один рядок для економії місця
+            # Назва та дата завантажуються безпосередньо з session_state
             col_name, col_date = st.columns(2)
             with col_name:
-                current_date_str = datetime.now().strftime("%Y-%m-%d")
-                default_name = f"Активність {current_date_str}"
-                act_name = st.text_input("Назва активності", value=default_name, key="act_name",
-                                         label_visibility="collapsed")
+                act_name = st.text_input("Назва активності", key="act_name", label_visibility="collapsed")
             with col_date:
-                act_date = st.date_input("Дата", value=datetime.now(), key="act_date",
-                                         label_visibility="collapsed")
+                act_date = st.date_input("Дата", key="act_date", label_visibility="collapsed")
 
             st.markdown("##### 👥 Виберіть гравців з блоку")
             act_players = st.multiselect(
                 "Учасники",
-                options=sorted(active_nicks),
+                options=sorted(list(set(active_nicks + st.session_state.get("act_players", [])))),
                 key="act_players",
                 label_visibility="collapsed"
             )
@@ -1660,7 +1710,7 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
 
                 st.markdown("##### Відсоток на казну:")
                 act_treasury_pct = st.number_input("Відсоток (0-100%)", min_value=0.0, max_value=100.0,
-                                                   value=10.0, step=1.0, label_visibility="collapsed")
+                                                   step=1.0, label_visibility="collapsed", key="act_treasury_pct")
 
                 treasury_amount = st.session_state.act_total_sum * (act_treasury_pct / 100)
                 pool_amount = st.session_state.act_total_sum - treasury_amount
@@ -1765,6 +1815,13 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                         st.success("Успішно збережено!")
                         st.session_state.act_edit_id = None
                         st.session_state.act_total_sum = 0.0
+                        st.session_state["act_name"] = f"Активність {datetime.now().strftime('%Y-%m-%d')}"
+                        st.session_state["act_date"] = datetime.now().date()
+                        st.session_state["act_players"] = []
+                        st.session_state["act_treasury_pct"] = 10.0
+                        for key in list(st.session_state.keys()):
+                            if key.startswith("act_t_") or key.startswith("act_p_") or key.startswith("act_m_"):
+                                del st.session_state[key]
                         time.sleep(0.5)
                         st.rerun()
 
