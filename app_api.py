@@ -528,19 +528,22 @@ class DatabaseManager:
             conn.commit()
 
     def save_snapshot(self, snapshot_type: str, stats: dict, custom_timestamp: str = None):
-        """Зберігає зріз. Для 00:00 зберігає історію по днях, для КВ — перезаписує поточний день."""
+        """Зберігає зріз із прив'язкою до дати, не видаляючи історію минулих днів."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
 
-            if snapshot_type == "00:00":
-                # Для 00:00 видаляємо дублікати ТІЛЬКИ ЗА СЬОГОДНІШНІЙ ДЕНЬ (щоб не було 2 записів за один день)
-                today_date = (datetime.datetime.now(KYIV_TZ)).strftime('%Y-%m-%d')
+            if custom_timestamp:
+                target_date = custom_timestamp.split()[0]
+            else:
+                target_date = datetime.datetime.now(KYIV_TZ).strftime('%Y-%m-%d')
+
+            if snapshot_type in ("00:00", "21:00", "CW_END"):
+                # Видаляємо перезапис ТІЛЬКИ ЗА ТОЙ ЖЕ ДЕНЬ для збереження історії минулих днів
                 cursor.execute("""
                     DELETE FROM daily_snapshots 
-                    WHERE snapshot_type = '00:00' AND nickname = ? AND DATE(timestamp) = ?
-                """, (stats["nickname"], today_date))
+                    WHERE snapshot_type = ? AND nickname = ? AND DATE(timestamp) = ?
+                """, (snapshot_type, stats["nickname"], target_date))
             else:
-                # Для КВ-зрізів (21:00, CW_END, CUSTOM) перезаписуємо старий зріз
                 cursor.execute("""
                     DELETE FROM daily_snapshots 
                     WHERE snapshot_type = ? AND nickname = ?
@@ -570,6 +573,48 @@ class DatabaseManager:
                 ))
             conn.commit()
 
+    def get_cw_dates(self) -> list:
+        """Повертає список дат (YYYY-MM-DD), у які є збережені КВ-зрізи."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT DISTINCT DATE(timestamp) as cw_date 
+                FROM daily_snapshots 
+                WHERE snapshot_type IN ('21:00', 'CW_END')
+                ORDER BY cw_date DESC
+            """)
+            rows = cursor.fetchall()
+            return [r[0] for r in rows if r[0]]
+
+    def get_snapshot_by_date(self, snapshot_type: str, date_str: str) -> dict:
+        """Отримує зріз за конкретний тип і дату (YYYY-MM-DD)."""
+        with self.get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM daily_snapshots 
+                WHERE snapshot_type = ? AND DATE(timestamp) = ?
+            """, (snapshot_type, date_str))
+            rows = cursor.fetchall()
+            return {row["nickname"]: dict(row) for row in rows}
+
+    def get_player_cw_history(self, nickname: str) -> list:
+        """Повертає історію КВ конкретного гравця за всі наявні дати."""
+        dates = self.get_cw_dates()
+        history = []
+        for d in dates:
+            snap_start = self.get_snapshot_by_date("21:00", d)
+            snap_end = self.get_snapshot_by_date("CW_END", d)
+
+            start = snap_start.get(nickname)
+            end = snap_end.get(nickname)
+
+            if start and end:
+                m = AnalyticsEngine.compute_cw_metrics(start, end)
+                m["date"] = d
+                history.append(m)
+        return history
+
     def get_snapshot(self, snapshot_type: str) -> dict:
         with self.get_connection() as conn:
             conn.row_factory = sqlite3.Row
@@ -586,11 +631,11 @@ class DatabaseManager:
                 cursor.execute("SELECT * FROM daily_snapshots WHERE nickname = ? ORDER BY timestamp DESC LIMIT 1",
                                (nickname,))
             else:
-                target_date = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=days_ago)).strftime(
-                    '%Y-%m-%d %H:%M:%S')
+                # Формуємо дату у форматі YYYY-MM-DD для точного пошуку за календарний день
+                target_date = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=days_ago)).strftime('%Y-%m-%d')
                 cursor.execute("""
                     SELECT * FROM daily_snapshots 
-                    WHERE nickname = ? AND snapshot_type = '00:00' AND timestamp <= ?
+                    WHERE nickname = ? AND snapshot_type = '00:00' AND DATE(timestamp) = ?
                     ORDER BY timestamp DESC LIMIT 1
                 """, (nickname, target_date))
             row = cursor.fetchone()
@@ -639,10 +684,11 @@ def run_background_scheduler():
 
                 # --- ПОЧАТОК НОВОГО КВ ЦИКЛУ (20:59 / 21:00) ---
                 if hour == 20 and minute == 59 and (today_str, "21:00") not in executed_tasks:
-                    logger.info("⏰ [SCHEDULE] Запуск нового КВ циклу: очищення старих КВ зрізів і збір 21:00...")
-                    # Очищаємо попередні зрізи КВ (21:00 та CW_END), щоб почати новий день начисто
-                    db.clear_daily_data("21:00")
-                    db.clear_daily_data("CW_END")
+                    logger.info(
+                        "⏰ [SCHEDULE] Запуск нового КВ циклу: очищення сьогоднішніх КВ зрізів і збір 21:00...")
+                    # Очищаємо зрізи ТІЛЬКИ ЗА СЬОГОДНІ, зберігаючи історію минулих днів
+                    db.clear_daily_data("21:00", only_today=True)
+                    db.clear_daily_data("CW_END", only_today=True)
                     db.clear_daily_data("CUSTOM_START")
                     db.clear_daily_data("CUSTOM_END")
 
@@ -661,7 +707,7 @@ def run_background_scheduler():
                 # --- КІНЕЦЬ КВ ЦИКЛУ (CW_END) ---
                 if curr_total_mins == target_cw_total_mins and (today_str, "CW_END") not in executed_tasks:
                     logger.info(f"⏰ [SCHEDULE] Виконання зрізу CW_END (запуск о {hour}:{minute:02d})...")
-                    db.clear_daily_data("CW_END")
+                    db.clear_daily_data("CW_END", only_today=True)
                     for g_name in cw_blocks:
                         if g_name in groups:
                             for nick in groups[g_name]:
@@ -670,6 +716,18 @@ def run_background_scheduler():
                                     db.save_snapshot("CW_END", stats)
                     executed_tasks[(today_str, "CW_END")] = True
                     logger.info("✅ [SCHEDULE] Зріз CW_END завершено. Статистика актуальна до наступного КВ.")
+
+                # --- АВТОМАТИЧНИЙ ЗАПИС КВ В БД О 22:30 ТІЛЬКИ ДЛЯ АВТО-СКАНО ВАНИХ БЛОКІВ ---
+                if hour == 22 and minute == 30 and (today_str, "22:30_CW_SAVE") not in executed_tasks:
+                    logger.info("⏰ [SCHEDULE] Фіксування підсумкового зрізу КВ за день о 22:30...")
+                    for g_name in cw_blocks:
+                        if g_name in groups:
+                            for nick in groups[g_name]:
+                                stats = api_client.fetch_player_stats(nick)
+                                if stats.get("status") == "OK":
+                                    db.save_snapshot("CW_END", stats)
+                    executed_tasks[(today_str, "22:30_CW_SAVE")] = True
+                    logger.info("✅ [SCHEDULE] Підсумковий КВ запис у БД о 22:30 успішно збережено!")
 
             # --- АВТОМАТИЧНЕ ЗБЕРЕЖЕННЯ ТА ПЕРЕДАЧА НА GOOGLE DRIVE О 23:00 ТА 00:30 ЗА КИЄВОМ ---
             if (hour == 23 and minute == 0) or (hour == 0 and minute == 30):
@@ -1113,30 +1171,27 @@ def main():
                     st.rerun()
 
                 st.divider()
-                st.caption("🧪 Запис картки гравця:")
+                st.caption("⚔️ Ручне збереження КВ для обраного блоку:")
 
-                col_hist1, col_hist2 = st.columns(2)
-                with col_hist1:
-                    if st.button("📸 1 день тому", width='stretch', help="Зберегти дані за -1 день"):
-                        if not st.session_state.live_stats:
-                            st.warning("Спочатку отримайте дані!")
-                        else:
-                            ts_1d = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=1)).strftime(
-                                '%Y-%m-%d %H:%M:%S')
-                            for nick, stats in st.session_state.live_stats.items():
-                                db.save_snapshot("DAILY_TEST_1D", stats, custom_timestamp=ts_1d)
-                            st.success("✅ Записано тестовий зріз за 1 день тому!")
+                if st.button("📸 Зберегти зріз за КВ для вибраного блоку", width='stretch'):
+                    if not active_nicks:
+                        st.error("Оберіть блок гравців у списку вище!")
+                    elif not st.session_state.live_stats:
+                        st.warning("Спочатку отримайте дані через 'Отримати дані'!")
+                    else:
+                        # Отримуємо актуальний зріз 21:00 з бази даних перед перевіркою
+                        snap_21 = db.get_snapshot("21:00")
 
-                with col_hist2:
-                    if st.button("📸 3 дні тому", width='stretch', help="Зберегти дані за -3 дні"):
-                        if not st.session_state.live_stats:
-                            st.warning("Спочатку отримайте дані!")
-                        else:
-                            ts_3d = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=3)).strftime(
-                                '%Y-%m-%d %H:%M:%S')
-                            for nick, stats in st.session_state.live_stats.items():
-                                db.save_snapshot("DAILY_TEST_3D", stats, custom_timestamp=ts_3d)
-                            st.success("✅ Записано тестовий зріз за 3 дні тому!")
+                        if not snap_21:
+                            for nick in active_nicks:
+                                if nick in st.session_state.live_stats:
+                                    db.save_snapshot("21:00", st.session_state.live_stats[nick])
+                        for nick in active_nicks:
+                            if nick in st.session_state.live_stats:
+                                db.save_snapshot("CW_END", st.session_state.live_stats[nick])
+                        st.success(f"✅ Зріз КВ для блоку '{selected_group}' зафіксовано в БД!")
+                        time.sleep(1)
+                        st.rerun()
 
                 st.divider()
 
@@ -1364,50 +1419,80 @@ def main():
 
         # ---------------- РЕЖИМ 2: ЗРІЗ (АНАЛІТИКА) ----------------
     elif mode in ["⚔️ Після КВ \\ Зріз (Аналітика)", "⚔️ Зріз (аналітика)"]:
-        if not active_nicks:
+        if not active_nicks and "selected_cw_date" not in st.session_state:
             st.info("👈 Оберіть або створіть блок гравців у панелі ліворуч.")
             return
 
         st.subheader(f"⚔️ Аналітичний блок: '{selected_group}'")
 
-        is_custom_complete = bool(st.session_state.custom_start and st.session_state.custom_end)
+        cw_dates = db.get_cw_dates()
+        date_options = ["Актуальні значення"] + cw_dates
 
+        col_date, col_spacer = st.columns([1.5, 2])
+        with col_date:
+            selected_cw_date = st.selectbox(
+                "📅 Оберіть дату КВ для аналізу:",
+                options=date_options,
+                index=0,
+                help="За замовчуванням 'Актуальні значення' показують сьогоденні дані КВ."
+            )
+
+        is_custom_complete = bool(st.session_state.custom_start and st.session_state.custom_end)
         analytics_source = "Стандартний КВ"
-        if is_custom_complete:
-            col_info, col_choice = st.columns([2, 1])
-            with col_info:
-                st.info("⏱️ Знайдено збережений **Екстренний/Ручний зріз** (Початок -> Кінець).")
-            with col_choice:
-                analytics_source = st.radio(
-                    "Джерело аналітики:",
-                    options=["⏱️ Ручний зріз", "⚔️ Стандартний КВ (21:00 -> КВ)"],
-                    horizontal=True
-                )
-        elif is_tracking_active:
-            st.warning("⏳ **Зріз у процесі!** Натисніть 🛑 Кінець в сайдбарі після закінчення.")
-        else:
-            if not snap_21:
-                st.warning(
-                    "⏳ **Зріз 21:00 ще не зафіксовано в базі.** Аналітика КВ буде доступна після 21:00 (або після збереження зрізу 21:00).")
+
+        # Фіксуємо вибірку актуальних зрізів СУВОРО за поточний день
+        today_str = datetime.datetime.now(KYIV_TZ).strftime('%Y-%m-%d')
+        snap_21_today = db.get_snapshot_by_date("21:00", today_str)
+        snap_cw_today = db.get_snapshot_by_date("CW_END", today_str)
+
+        if selected_cw_date == "Актуальні значення":
+            if is_custom_complete:
+                col_info, col_choice = st.columns([2, 1])
+                with col_info:
+                    st.info("⏱️ Знайдено збережений **Екстренний/Ручний зріз** (Початок -> Кінець).")
+                with col_choice:
+                    analytics_source = st.radio(
+                        "Джерело аналітики:",
+                        options=["⏱️ Ручний зріз", "⚔️ Стандартний КВ (21:00 -> КВ)"],
+                        horizontal=True
+                    )
+            elif is_tracking_active:
+                st.warning("⏳ **Зріз у процесі!** Натисніть 🛑 Кінець в сайдбарі після закінчення.")
             else:
-                st.info("⚔️ Відображається статистика за наявними даними КВ.")
+                if not snap_21_today:
+                    st.warning(
+                        "⏳ **Зріз 21:00 ще не зафіксовано в базі.** Аналітика КВ буде доступна після 21:00 (або після збереження зрізу 21:00).")
+                else:
+                    st.info("⚔️ Відображається актуальна статистика КВ за сьогодні.")
+
+            target_nicks = active_nicks
+        else:
+            st.success(f"📅 Перегляд збереженого архіву КВ за дату: **{selected_cw_date}**")
+            snap_21_hist = db.get_snapshot_by_date("21:00", selected_cw_date)
+            snap_cw_hist = db.get_snapshot_by_date("CW_END", selected_cw_date)
+
+            # Витягуємо безпосередньо гравців із цього історичного зрізу
+            target_nicks = list(set(snap_21_hist.keys()) | set(snap_cw_hist.keys()))
 
         rows = []
         use_custom = (analytics_source == "⏱️ Ручний зріз") and is_custom_complete
 
-        for nick in active_nicks:
-            if use_custom:
-                start = st.session_state.custom_start.get(nick, {})
-                end = st.session_state.custom_end.get(nick, {})
-            else:
-                # КРИТИЧНЕ ВИПРАВЛЕННЯ: Для КВ використовуємо СТРОГО snap_21 (БЕЗ фолбеку на 00:00)
-                start = snap_21.get(nick, {})
-
-                # Якщо КВ завершено і є фіксований snap_cw — беремо його. Якщо КВ іде — беремо live_stats.
-                if snap_cw:
-                    end = snap_cw.get(nick, {})
+        for nick in target_nicks:
+            if selected_cw_date == "Актуальні значення":
+                if use_custom:
+                    start = st.session_state.custom_start.get(nick, {})
+                    end = st.session_state.custom_end.get(nick, {})
                 else:
-                    end = st.session_state.live_stats.get(nick, {})
+                    start = snap_21_today.get(nick, {})
+                    if snap_cw_today:
+                        end = snap_cw_today.get(nick, {})
+                    elif snap_21_today:
+                        end = st.session_state.live_stats.get(nick, {})
+                    else:
+                        end = {}
+            else:
+                start = snap_21_hist.get(nick, {})
+                end = snap_cw_hist.get(nick, {})
 
             if not start or not end:
                 status_text = "Очікування 21:00" if not start else "Очікування кінця КВ"
@@ -1442,15 +1527,18 @@ def main():
 
         df_post = pd.DataFrame(rows)
 
-        styled_df = (
-            df_post.style
-            .format("{:.1f}", subset=["ТР за період"])
-            .format("{:+.1f}%", subset=["Різниця з загальним (%)"])
-            .format("{:.2f}", subset=["У/С", "УП/С", "УН/УП"])
-            .map(AnalyticsEngine.get_color_style, subset=["У/С", "УП/С", "УН/УП"])
-            .map(AnalyticsEngine.get_tp_diff_style, subset=["Різниця з загальним (%)"])
-        )
-        st.dataframe(styled_df, width='stretch', height=450)
+        if not df_post.empty:
+            styled_df = (
+                df_post.style
+                .format("{:.1f}", subset=["ТР за період"])
+                .format("{:+.1f}%", subset=["Різниця з загальним (%)"])
+                .format("{:.2f}", subset=["У/С", "УП/С", "УН/УП"])
+                .map(AnalyticsEngine.get_color_style, subset=["У/С", "УП/С", "УН/УП"])
+                .map(AnalyticsEngine.get_tp_diff_style, subset=["Різниця з загальним (%)"])
+            )
+            st.dataframe(styled_df, width='stretch', height=450)
+        else:
+            st.warning("Дані за обрану дату відсутні.")
 
     # ---------------- РЕЖИМ 3: 🎴 КАРАТКА ГРАВЦІВ ----------------
     elif mode == "🎴 Картка гравців":
@@ -1657,6 +1745,43 @@ def main():
                         build_delta_col("За 7 Днів (Тиждень)", 7)
                     with col_d30:
                         build_delta_col("За 30 Днів (Місяць)", 30)
+
+                    st.divider()
+                    st.markdown("### ⚔️ Історія виступів гравця на КВ")
+
+                    player_cw_hist = db.get_player_cw_history(selected_player)
+
+                    if not player_cw_hist:
+                        st.info("ℹ️ Для цього гравця ще немає збережених записів КВ у базі.")
+                    else:
+                        cw_count = len(player_cw_hist)
+                        avg_cw_tp = round(sum(h["slice_tp"] for h in player_cw_hist) / cw_count, 1)
+                        avg_cw_kd = round(sum(h["kd"] for h in player_cw_hist) / cw_count, 2)
+                        total_cw_kills = sum(int(h["cw_score"].split(" / ")[0]) for h in player_cw_hist)
+                        total_cw_deaths = sum(int(h["cw_score"].split(" / ")[1]) for h in player_cw_hist)
+
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        mc1.metric("Зіграно КВ", f"{cw_count}")
+                        mc2.metric("Сер. ТР на КВ", f"{avg_cw_tp}")
+                        mc3.metric("Сер. K/D на КВ", f"{avg_cw_kd}")
+                        mc4.metric("Настріл КВ (У/С)", f"{total_cw_kills} / {total_cw_deaths}")
+
+                        df_player_cw = pd.DataFrame([
+                            {
+                                "Дата КВ": h["date"],
+                                "ТР за КВ": h["slice_tp"],
+                                "Настріл (У/С/П)": h["cw_score"],
+                                "У/С": h["kd"],
+                                "УП/С": h["kad"],
+                                "Гранат": h["grenades"],
+                                "Шкода (УН/УП)": h["damage"],
+                                "УН/УП": h["un_up"],
+                                "Точність": h["accuracy"]
+                            }
+                            for h in player_cw_hist
+                        ])
+
+                        st.dataframe(df_player_cw, width='stretch', height=300)
 
     # ---------------- РЕЖИМ 4: 🛡️ КЛАНОВІ МЕТРИКИ (ТІЛЬКИ АДМІН) ----------------
     elif mode == "🛡️ Кланові метрики" and is_admin:
