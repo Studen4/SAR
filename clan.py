@@ -228,18 +228,35 @@ class AnalyticsEngine:
     def parse_tabs(tab_urls: list[str], our_clan_name: str, max_tabs: int = 3) -> list[dict]:
         extracted_stages = []
         system_prompt = f"""
-                Ти — експерт з OCR та комп'ютерного зору для аналізу скріншотів таблиць (табів) з гри STALCRAFT.
-                ЗАВДАННЯ: Проаналізуй надане зображення табу. Наш клан: "{our_clan_name}".
-                ФОРМАТ ВІДПОВІДІ (ТІЛЬКИ JSON):
-                {{
-                    "our_clan": "{our_clan_name}",
-                    "our_score": 0,
-                    "enemy_clan": "НазваВорога",
-                    "enemy_score": 0,
-                    "online": 0,
-                    "players": ["Nick1", "Nick2"]
-                }}
-                """
+        Ти — експерт з OCR та комп'ютерного зору для аналізу скріншотів таблиць (табів) з гри STALCRAFT.
+
+        ЗАВДАННЯ: Проаналізуй надане зображення табу та витягни дані у строго визначеному форматі JSON.
+        Наш клан: "{our_clan_name}".
+
+        ПРАВИЛА ОБРОБКИ КЛАНІВ ТА ОЧОК (Блок "Преимущество по очкам" ліворуч):
+        1. "our_clan": Вкажи назву нашого клану — "{our_clan_name}".
+        2. "our_score": Знайди в блоці "Преимущество по очкам" наш клан і вкажи його кількість очок (ціле число).
+        3. "enemy_clan" та "enemy_score":
+           - Знайди всі інші клани (суперники), окрім нашого ("{our_clan_name}").
+           - Якщо суперників декілька (наприклад, режим на 4 клани), ОБЕРИ ТІЛЬКИ ОДНОГО СУПЕРНИКА З НАЙБІЛЬШОЮ КІЛЬКІСТЮ ОЧОК (найсильнішого ворога).
+           - У "enemy_clan" запиши назву цього найсильнішого ворожого клану.
+           - У "enemy_score" запиши його очки (ціле число).
+           - Усіх інших ворогів з меншою кількістю очок повністю ігноруй.
+
+        ПРАВИЛА ОБРОБКИ ГРАВЦІВ (Таблиця праворуч):
+        4. "online": Загальна кількість гравців нашого клану у правому списку.
+        5. "players": Масив із нікнеймами всіх гравців нашого клану (перша колонка правої таблиці).
+
+        ФОРМАТ ВІДПОВІДІ (ТІЛЬКИ JSON, БЕЗ МАРКДАУН-ОБОРТОК ТА ДОДАТКОВОГО ТЕКСТУ):
+        {{
+            "our_clan": "{our_clan_name}",
+            "our_score": 0,
+            "enemy_clan": "НазваВорога",
+            "enemy_score": 0,
+            "online": 0,
+            "players": ["Nick1", "Nick2"]
+        }}
+        """
 
         valid_urls = [u.strip() for u in tab_urls if u.strip()][:max_tabs]
         FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
@@ -507,6 +524,45 @@ def get_workspace_events(db) -> dict:
                 "results": r[9], "comments": r[10]
             }
         return events
+
+
+def parse_workspace_results(results_text: str) -> list[dict]:
+    """
+    Парсить рядки результатів КВ з Workspace.
+    Формат рядків: Second Army (2928) VS Free Institute (2794) - WIN (100p+)
+    """
+    if not results_text or not isinstance(results_text, str):
+        return []
+
+    matches = []
+    pattern = r"^(.*?)\s*\(([\d.]+)\)\s*VS\s*(.*?)\s*\((.*?)\)\s*-\s*(WIN|LOSS)"
+
+    for line in results_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(pattern, line, re.IGNORECASE)
+        if m:
+            our_clan, our_tp_str, enemy_clan, enemy_tp_str, outcome = m.groups()
+            try:
+                our_tp = float(our_tp_str)
+            except ValueError:
+                our_tp = 0.0
+
+            try:
+                enemy_tp_val = float(enemy_tp_str)
+            except ValueError:
+                enemy_tp_val = None
+
+            matches.append({
+                "our_clan": our_clan.strip(),
+                "our_tp": our_tp,
+                "enemy_clan": enemy_clan.strip(),
+                "enemy_tp_str": enemy_tp_str.strip(),
+                "enemy_tp_val": enemy_tp_val,
+                "outcome": outcome.upper()
+            })
+    return matches
 
 
 def save_workspace_event(db, data: dict):
@@ -1415,9 +1471,18 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
             "Вересень 2027": (2027, 9),
         }
 
+        # Динамічне визначення поточного місяця за системною датою
+        now_dt = datetime.now()
+        month_keys = list(months_map.keys())
+        default_month_idx = 0
+        for idx, (m_label, (y, m)) in enumerate(months_map.items()):
+            if y == now_dt.year and m == now_dt.month:
+                default_month_idx = idx
+                break
+
         col_search_1, col_search_2 = st.columns([1, 3])
         with col_search_1:
-            selected_month_label = st.selectbox("Місяць", list(months_map.keys()), index=0)
+            selected_month_label = st.selectbox("Місяць", month_keys, index=default_month_idx)
         with col_search_2:
             search_query = st.text_input("🔍 Пошук по ключовим словам / противнику:",
                                          placeholder="Наприклад: Phobos або Хвойний").strip()
@@ -1577,6 +1642,19 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
     # Вкладка 4: АКТИВНОСТІ (Фарм, виноси, тощо)
     # ---------------------------------------------------------
     with clan_tabs[3]:
+        # Безопечне скидання стану форми ДО ініціалізації віджетів
+        if st.session_state.get("_reset_act_form", False):
+            st.session_state.act_edit_id = None
+            st.session_state.act_total_sum = 0.0
+            st.session_state["act_name"] = f"Активність {datetime.now().strftime('%Y-%m-%d')}"
+            st.session_state["act_date"] = datetime.now().date()
+            st.session_state["act_players"] = []
+            st.session_state["act_treasury_pct"] = 10.0
+            for key in list(st.session_state.keys()):
+                if key.startswith("act_t_") or key.startswith("act_p_") or key.startswith("act_m_"):
+                    del st.session_state[key]
+            st.session_state["_reset_act_form"] = False
+
         # Ініціалізація стану калькулятора та редагування
         if "act_total_sum" not in st.session_state:
             st.session_state.act_total_sum = 0.0
@@ -1599,16 +1677,7 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
 
             # Кнопка створення нових даних
             if st.button("➕ Створити нову активність", type="primary", width='stretch'):
-                st.session_state.act_edit_id = None
-                st.session_state.act_total_sum = 0.0
-                st.session_state["act_name"] = f"Активність {datetime.now().strftime('%Y-%m-%d')}"
-                st.session_state["act_date"] = datetime.now().date()
-                st.session_state["act_players"] = []
-                st.session_state["act_treasury_pct"] = 10.0
-                # Очищаємо дані попередніх розрахунків
-                for key in list(st.session_state.keys()):
-                    if key.startswith("act_t_") or key.startswith("act_p_") or key.startswith("act_m_"):
-                        del st.session_state[key]
+                st.session_state["_reset_act_form"] = True
                 st.rerun()
 
             all_acts = get_all_activities(db)
@@ -1653,18 +1722,8 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                             if st.button("🗑️", key=f"del_act_{act['id']}", help="Видалити активність"):
                                 delete_clan_activity(db, act['id'])
                                 if st.session_state.act_edit_id == act['id']:
-                                    st.session_state.act_edit_id = None
-                                    st.session_state.act_total_sum = 0.0
-                                    st.session_state[
-                                        "act_name"] = f"Активність {datetime.now().strftime('%Y-%m-%d')}"
-                                    st.session_state["act_date"] = datetime.now().date()
-                                    st.session_state["act_players"] = []
-                                    st.session_state["act_treasury_pct"] = 10.0
-                                    for key in list(st.session_state.keys()):
-                                        if key.startswith("act_t_") or key.startswith("act_p_") or key.startswith(
-                                                "act_m_"):
-                                            del st.session_state[key]
-                                st.toast("🗑️ Активність видалено!", icon="🗑️")
+                                    st.session_state["_reset_act_form"] = True
+                                st.toast("🗑️ Активність видалено!", icon="🗑️️")
                                 st.rerun()
 
         with col_act_left:
@@ -1781,7 +1840,7 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
 
                             # Розподіл грошового пулу між присутніми бійцями
                             p_share_in_pool = (
-                                        p_time / total_time_participants) if total_time_participants > 0 else 0
+                                    p_time / total_time_participants) if total_time_participants > 0 else 0
                             p_money = pool_amount * p_share_in_pool
 
                             st.session_state[f"act_p_{p_name}"] = f"{p_pct:.1f}%"
@@ -1828,15 +1887,7 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                             "players_data": players_data_to_save
                         })
                         st.success("Успішно збережено!")
-                        st.session_state.act_edit_id = None
-                        st.session_state.act_total_sum = 0.0
-                        st.session_state["act_name"] = f"Активність {datetime.now().strftime('%Y-%m-%d')}"
-                        st.session_state["act_date"] = datetime.now().date()
-                        st.session_state["act_players"] = []
-                        st.session_state["act_treasury_pct"] = 10.0
-                        for key in list(st.session_state.keys()):
-                            if key.startswith("act_t_") or key.startswith("act_p_") or key.startswith("act_m_"):
-                                del st.session_state[key]
+                        st.session_state["_reset_act_form"] = True
                         time.sleep(0.5)
                         st.rerun()
 
@@ -1903,19 +1954,16 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                 hist_grenades_sums.append(engine._safe_float(snap.get("grenades"), 0.0))
 
         hist_avg_grenades = (
-                    sum(hist_grenades_sums) / len(hist_grenades_sums)) if hist_grenades_sums else current_avg_grenades
+                sum(hist_grenades_sums) / len(hist_grenades_sums)) if hist_grenades_sums else current_avg_grenades
         grenades_diff = round(current_avg_grenades - hist_avg_grenades, 1)
         avg_grenades_val = st.session_state.get("avg_grenades_val", "?")
         grenades_delta_str = st.session_state.get("grenades_delta", 0)
 
-        # 3. ВІНРЕЙТ ТА ДЕЛЬТА, НАЙБІЛЬША ПЕРЕМОГА
+        # 3. ВІНРЕЙТ ТА СТАТИСТИКА ПО КАРТАХ/ВІДВІДУВАНОСТІ
         total_wins = 0
         total_games = 0
         map_stats = {}
         attendance_counter = Counter()
-
-        best_win_clan = "?"
-        max_rating = -1
 
         for ev in period_events:
             res_text = ev.get("results", "")
@@ -1957,21 +2005,100 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                 except ValueError:
                     continue
 
-            # ВИПРАВЛЕНИЙ БЛОК: Пошук найбільшої перемоги безпосередньо з рядків results
+        # 4. ОБЧИСЛЕННЯ НАЙБІЛЬШОЇ ПЕРЕМОГИ ТА ТР КЛАНУ З WORKSPACE
+        all_period_wins = []
+        period_daily_max_tps = []
+
+        for ev in period_events:
+            res_text = ev.get("results", "")
+            day_tps = []
             for line in res_text.splitlines():
                 line = line.strip()
-                if not line or "WIN" not in line.upper():
+                if not line:
                     continue
 
-                # Приклад рядка: "Second Army (2869) VS Over Heaven (2900) - WIN (100p+)"
-                match = re.search(r'VS\s+(.+?)\s*\((?:TP\s*)?(\d+)\)\s*-\s*WIN', line, re.IGNORECASE)
-                if match:
-                    c_name = match.group(1).strip()
-                    c_rating = int(match.group(2))
+                m_full = re.search(r'^(.*?)\((\d+)\)\s+VS\s+(.+?)\s*\((?:TP\s*)?(\d+)\)\s*-\s*(WIN|LOSS)', line,
+                                   re.IGNORECASE)
+                m_short = re.search(r'VS\s+(.+?)\s*\((?:TP\s*)?(\d+)\)\s*-\s*(WIN|LOSS)', line,
+                                    re.IGNORECASE) if not m_full else None
 
-                    if c_rating > max_rating:
-                        max_rating = c_rating
-                        best_win_clan = f"{c_name} ({c_rating})"
+                if m_full:
+                    o_tp = int(m_full.group(2))
+                    e_clan = m_full.group(3).strip()
+                    e_tp = int(m_full.group(4))
+                    outc = m_full.group(5).upper()
+                elif m_short:
+                    o_tp = 0
+                    e_clan = m_short.group(1).strip()
+                    e_tp = int(m_short.group(2))
+                    outc = m_short.group(3).upper()
+                else:
+                    continue
+
+                if o_tp > 0:
+                    day_tps.append(o_tp)
+
+                if outc == "WIN":
+                    all_period_wins.append({"enemy_clan": e_clan, "enemy_tp": e_tp})
+
+            if day_tps:
+                period_daily_max_tps.append(max(day_tps))
+
+        # Визначення найбільшої перемоги за вибраний період
+        if all_period_wins:
+            best_win = max(all_period_wins, key=lambda x: x["enemy_tp"])
+            biggest_win_str = f"{best_win['enemy_clan']} ({best_win['enemy_tp']})"
+        else:
+            biggest_win_str = "?"
+
+        # ТР клану за обраний період (середнє найбільших значень за кожен заповнений день)
+        if period_daily_max_tps:
+            avg_p_tp = sum(period_daily_max_tps) / len(period_daily_max_tps)
+            clan_tp_val = round(avg_p_tp) if avg_p_tp == int(avg_p_tp) else round(avg_p_tp, 1)
+        else:
+            avg_p_tp = 0.0
+            clan_tp_val = "?"
+
+        # Обчислення базового 30-денного / місячного ТР клану для дельти
+        now_dt = datetime.now()
+        month_daily_max_tps = []
+        for d_str in sorted_dates:
+            ev = events_data[d_str]
+            res_text = ev.get("results", "")
+            day_tps = []
+            for line in res_text.splitlines():
+                m = re.search(r'\((\d+)\)\s+VS', line, re.IGNORECASE)
+                if m:
+                    day_tps.append(int(m.group(1)))
+            if day_tps:
+                try:
+                    ev_dt = datetime.strptime(d_str, "%Y-%m-%d")
+                    if ev_dt.year == now_dt.year and ev_dt.month == now_dt.month:
+                        month_daily_max_tps.append(max(day_tps))
+                except ValueError:
+                    pass
+
+        if not month_daily_max_tps:
+            for d_str in sorted_dates:
+                try:
+                    ev_date = datetime.strptime(d_str, "%Y-%m-%d").date()
+                    if (latest_date - ev_date).days < 30:
+                        ev = events_data[d_str]
+                        res_text = ev.get("results", "")
+                        day_tps = [int(m.group(1)) for m in re.finditer(r'\((\d+)\)\s+VS', res_text, re.IGNORECASE)]
+                        if day_tps:
+                            month_daily_max_tps.append(max(day_tps))
+                except ValueError:
+                    continue
+
+        tp_30 = (sum(month_daily_max_tps) / len(month_daily_max_tps)) if month_daily_max_tps else 0.0
+
+        # Дельта ТР у %
+        if avg_p_tp > 0 and tp_30 > 0:
+            tp_diff_pct = round(((avg_p_tp - tp_30) / tp_30) * 100, 2)
+            tp_delta_str = f"{tp_diff_pct:+.2f}%" if tp_diff_pct != 0 else "0.00%"
+        else:
+            tp_delta_str = "0.00%"
 
         winrate_pct = round((total_wins / total_games) * 100) if total_games > 0 else 0
         winrate_val = f"{winrate_pct}%" if total_games > 0 else "?"
@@ -1984,47 +2111,6 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
         latest_wr = round((latest_wins / latest_total) * 100) if latest_total > 0 else winrate_pct
         wr_diff = round(latest_wr - winrate_pct, 1)
         winrate_delta_str = f"+{wr_diff}%" if wr_diff > 0 else f"{wr_diff}%"
-
-        # 4. ТР КЛАНУ ТА ДЕЛЬТА ЗА ПЕРІОД
-        active_tp_sum = 0.0
-        active_count = 0
-        for nick in active_nicks:
-            eq = get_player_equip(db, nick)
-            if eq.get("otryad_num", 0) > 0:
-                curr = st.session_state.get("live_stats", {}).get(nick)
-                if not curr and hasattr(db, "get_historical_snapshot"):
-                    curr = db.get_historical_snapshot(nick, 0)
-                active_tp_sum += engine.calc_tp(curr if curr else {})
-                active_count += 1
-
-        clan_tp_val = round(active_tp_sum) if active_count > 0 else "?"
-        biggest_win_str = best_win_clan if max_rating != -1 else "?"
-
-        def get_clan_tp_at_days(days_ago):
-            total_tp = 0.0
-            count = 0
-            for nick in active_nicks:
-                eq = get_player_equip(db, nick)
-                if eq.get("otryad_num", 0) > 0:
-                    snap = db.get_historical_snapshot(nick, days_ago) if hasattr(db, "get_historical_snapshot") else {}
-                    if snap:
-                        total_tp += engine.calc_tp(snap)
-                    else:
-                        curr = st.session_state.get("live_stats", {}).get(nick, {})
-                        total_tp += engine.calc_tp(curr)
-                    count += 1
-            return round(total_tp, 1) if count > 0 else 0.0
-
-        current_clan_tp_num = float(clan_tp_val) if isinstance(clan_tp_val, (int, float)) else 0.0
-        tp_period_ago = get_clan_tp_at_days(period_days)
-        tp_diff = round(current_clan_tp_num - tp_period_ago, 1) if tp_period_ago > 0 else 0.0
-
-        if tp_diff > 0:
-            tp_delta_str = f"+{tp_diff}"
-        elif tp_diff < 0:
-            tp_delta_str = f"{tp_diff}"
-        else:
-            tp_delta_str = "0"
 
         # ВЕРХНІ КАРТКИ ГЛОБАЛЬНОЇ СТАТИСТИКИ
         st.markdown(f"""
