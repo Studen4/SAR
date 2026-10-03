@@ -951,15 +951,21 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                 p_eq = get_player_equip(db, selected_edit_player)
                 eq_c1, eq_c2, eq_c3 = st.columns(3)
                 with eq_c1:
-                    sh_arm = st.text_input("Штурм б.", value=p_eq.get("assault_armor", "?"), key="sh_arm")
-                    bio_arm = st.text_input("Біо б.", value=p_eq.get("bio_armor", "?"), key="bio_arm")
+                    sh_arm = st.text_input("Штурм б.", value=p_eq.get("assault_armor", "?"),
+                                           key=f"sh_arm_{selected_edit_player}")
+                    bio_arm = st.text_input("Біо б.", value=p_eq.get("bio_armor", "?"),
+                                            key=f"bio_arm_{selected_edit_player}")
                 with eq_c2:
-                    sh_rif = st.text_input("Штурм г.", value=p_eq.get("assault_rifle", "?"), key="sh_rif")
-                    sn_rif = st.text_input("Снайперська г.", value=p_eq.get("sniper_rifle", "?"), key="sn_rif")
+                    sh_rif = st.text_input("Штурм г.", value=p_eq.get("assault_rifle", "?"),
+                                           key=f"sh_rif_{selected_edit_player}")
+                    sn_rif = st.text_input("Снайперська г.", value=p_eq.get("sniper_rifle", "?"),
+                                           key=f"sn_rif_{selected_edit_player}")
                 with eq_c3:
-                    build_val = st.text_input("Збірка", value=p_eq.get("build", "?"), key="build_val")
+                    build_val = st.text_input("Збірка", value=p_eq.get("build", "?"),
+                                              key=f"build_val_{selected_edit_player}")
                     otryad_n = st.number_input("Резерв", min_value=0, max_value=20,
-                                               value=int(p_eq.get("otryad_num", 0)), key="otr_num")
+                                               value=int(p_eq.get("otryad_num", 0)),
+                                               key=f"otr_num_{selected_edit_player}")
 
                 if st.button("💾 Оновити спорядження", width='stretch'):
                     save_player_equip(db, selected_edit_player, selected_group, {
@@ -972,11 +978,18 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                     st.rerun()
 
             st.markdown("---")
+
+            # Динамічний ліміт вибору для запобігання помилки StreamlitSelectionCountExceedsMaxError
+            effective_max_slots = max(int(max_slots), len(init_members))
+            if effective_max_slots > int(max_slots):
+                st.warning(
+                    f"⚠️ Ви додали або завантажили більше бійців ({len(init_members)}), ніж ліміт ({max_slots}). Ліміт автоматично збільшено до {effective_max_slots}.")
+
             selected_squad_members = st.multiselect(
                 f"Оберіть бійців з блоку '{selected_group}':",
                 options=sorted(active_nicks),
                 default=init_members,
-                max_selections=int(max_slots)
+                max_selections=effective_max_slots
             )
 
             col_sq_b1, col_sq_b2 = st.columns(2)
@@ -1026,18 +1039,17 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
                     squad_tp_list.append(tp)
 
                     eq_info = get_player_equip(db, nick)
-                    kills = curr.get("kills", 0) if isinstance(curr, dict) else 0
-                    deaths = curr.get("deaths", 1) if isinstance(curr, dict) else 1
 
                     squad_details.append({
                         "Нікнейм": nick,
                         "Тир": tier,
-                        "Total Power (ТР)": tp,
-                        "K/D": engine.calc_ratio(kills, deaths),
-                        "Штурм-б.": eq_info.get("assault_armor", "?"),
+                        "ТР": tp,
                         "Штурм-г.": eq_info.get("assault_rifle", "?"),
+                        "Снайперська-г.": eq_info.get("sniper_rifle", "?"),
+                        "Штурм-б.": eq_info.get("assault_armor", "?"),
+                        "Біо-б.": eq_info.get("bio_armor", "?"),
                         "Збірка": eq_info.get("build", "?"),
-                        "№ Отряду": eq_info.get("otryad_num", 0)
+                        "Номер отряду": eq_info.get("otryad_num", 0)
                     })
 
                 total_squad_tp = round(sum(squad_tp_list), 1)
@@ -1052,7 +1064,16 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
 
                 st.markdown("#### 📜 Склад отряду та спорядження:")
                 df_squad = pd.DataFrame(squad_details)
-                st.dataframe(df_squad, width='stretch')
+                st.dataframe(
+                    df_squad,
+                    width='stretch',
+                    hide_index=True,
+                    column_config={
+                        "Тир": st.column_config.TextColumn("Тир", width="small"),
+                        "ТР": st.column_config.NumberColumn("ТР", width="small", format="%.1f"),
+                        "Номер отряду": st.column_config.NumberColumn("Номер отряду", width="small")
+                    }
+                )
 
     # ---------------------------------------------------------
     # Вкладка 2: АКТИВНИЙ СКЛАД
@@ -1224,6 +1245,15 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
 
         st.markdown("---")
         st.markdown("#### 🛡️ Резерв Клана (Номер отряду = 0)")
+
+        if selected_p and selected_p not in reserve_players:
+            if st.button(f"📥 Перемістити {selected_p} в Резерв", key="res_btn_to_reserve", width='stretch',
+                         type="primary"):
+                move_player_to_squad_db(db, selected_group, selected_p, 0, "Резерв")
+                st.session_state.selected_swap_player = None
+                st.success(f"Гравець {selected_p} переведений в Резерв!")
+                time.sleep(0.3)
+                st.rerun()
 
         res_cols = st.columns(5)
         for r_idx, r_nick in enumerate(reserve_players):

@@ -93,7 +93,7 @@ def upload_db_to_drive(db_path: str = "stalzone_stats.db", file_id: str = None) 
 
 
 def download_latest_db_from_drive(db_path: str = "stalzone_stats.db", file_id: str = None) -> bool:
-    """Викачує файл бази даних з Google Drive за його ID та замінює ним локальну БД."""
+    """Викачує файл бази даних з Google Drive за його ID та зберігає за вказаним шляхом."""
     target_file_id = file_id or GOOGLE_DRIVE_FILE_ID
 
     service = get_drive_service()
@@ -111,9 +111,10 @@ def download_latest_db_from_drive(db_path: str = "stalzone_stats.db", file_id: s
             while not done:
                 status, done = downloader.next_chunk()
 
-        logger.info(f"✅ БД успішно завантажено та оновлено локально з Google Drive!")
+        logger.info(f"✅ Файл БД успішно скачано з Google Drive!")
         return True
 
     except Exception as e:
         logger.error(f"❌ Помилка викачування БД з Google Drive: {e}")
         return False
+    

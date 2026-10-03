@@ -40,31 +40,65 @@ KYIV_TZ = pytz.timezone("Europe/Kyiv")
 
 
 # ==========================================
-# АВТО-СИНХРОНІЗАЦІЯ ПРИ СТАРТІ / ВІДКАТІ
+# АВТО-СИНХРОНІЗАЦІЯ ПРИ СТАРТІ СЕРВЕРА
 # ==========================================
+def get_db_max_timestamp(db_path: str = "stalzone_stats.db") -> str:
+    """Повертає найновіший timestamp з daily_snapshots для перевірки свіжості бази."""
+    if not os.path.exists(db_path):
+        return ""
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(timestamp) FROM daily_snapshots")
+        row = cursor.fetchone()
+        conn.close()
+        return str(row[0]) if row and row[0] else ""
+    except Exception as e:
+        logger.warning(f"⚠️ Не вдалося перевірити timestamp для {db_path}: {e}")
+        return ""
+
+
+@st.cache_resource
 def auto_sync_db_on_startup():
     """
-    Перевіряє стан локальної БД при старті сесії.
-    Якщо локальна база відкатана або порожня, автоматично викачує останню версію з Google Drive.
+    Авто-синхронізація локальної БД СУВОРО 1 РАЗ при піднятті сервера Streamlit.
+    Перевіряє, чи є в хмарі суворо новіша версія бази даних.
     """
-    if "db_auto_synced" not in st.session_state:
-        st.session_state.db_auto_synced = True
-        db = DatabaseManager()
-        try:
-            with db.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) FROM player_groups")
-                groups_cnt = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(*) FROM daily_snapshots")
-                snaps_cnt = cursor.fetchone()[0]
+    local_db = "stalzone_stats.db"
+    temp_cloud_db = "stalzone_stats_cloud_temp.db"
 
-            # Якщо база повністю порожня (Streamlit скинув стан)
-            if groups_cnt == 0 and snaps_cnt == 0:
-                logger.info("⚠️ Виявлено порожню/відкатану БД. Виконується авто-відновлення з Google Drive...")
-                if download_latest_db_from_drive():
-                    logger.info("✅ Автоматичне відновлення з Google Drive пройшло успішно.")
-        except Exception as e:
-            logger.error(f"❌ Помилка при перевірці авто-синхронізації БД: {e}")
+    try:
+        local_ts = get_db_max_timestamp(local_db)
+        logger.info(f"🚀 Помічено запуск серверу — перевірка локальної БД (Дата: '{local_ts or 'Відсутня/Порожня'}')")
+
+        # 1. Скачуємо у тимчасовий файл для перевірки, зберігаючи всі повідомлення авторизації та завантаження
+        if download_latest_db_from_drive(db_path=temp_cloud_db):
+            cloud_ts = get_db_max_timestamp(temp_cloud_db)
+
+            # 2. Якщо хмарна БД суворо новіша за локальну
+            if cloud_ts and (not local_ts or cloud_ts > local_ts):
+                logger.info(
+                    f"🔄 Локальна БД ({local_ts or 'Відсутня'}) старіша за БД у Хмарі ({cloud_ts}) — проводимо заміну...")
+
+                import shutil
+                shutil.move(temp_cloud_db, local_db)
+
+                logger.info("✅ Заміна виконана успішно! Дані актуалізовано!")
+            else:
+                logger.info(
+                    f"ℹ️ Локальна БД ({local_ts or 'Порожня'}) актуальна або новіша за БД у Хмарі ({cloud_ts or 'Порожня'}). Заміна не потрібна.")
+                if os.path.exists(temp_cloud_db):
+                    os.remove(temp_cloud_db)
+
+    except Exception as e:
+        logger.error(f"❌ Помилка при авто-синхронізації БД: {e}")
+        if os.path.exists(temp_cloud_db):
+            try:
+                os.remove(temp_cloud_db)
+            except Exception:
+                pass
+
+    return True
 
 
 # ==========================================
@@ -737,11 +771,17 @@ def run_background_scheduler():
                 if (today_str, task_key) not in executed_tasks:
                     logger.info(
                         f"⏰ [SCHEDULE] Запуск автоматичного збереження та передачі БД на Google Drive ({time_str} Kyiv)...")
-                    if upload_db_to_drive():
-                        executed_tasks[(today_str, task_key)] = True
-                        logger.info(f"✅ [SCHEDULE] Резервну копію БД успішно відправлено на Google Drive ({time_str})!")
+                    # Запобіжник: відправляємо ТІЛЬКИ якщо в локальній БД є валідні записи
+                    if get_db_max_timestamp("stalzone_stats.db"):
+                        if upload_db_to_drive():
+                            executed_tasks[(today_str, task_key)] = True
+                            logger.info(
+                                f"✅ [SCHEDULE] Резервну копію БД успішно відправлено на Google Drive ({time_str})!")
+                        else:
+                            logger.error(
+                                f"❌ [SCHEDULE] Помилка відправки резервної копії БД на Google Drive ({time_str}).")
                     else:
-                        logger.error(f"❌ [SCHEDULE] Помилка відправки резервної копії БД на Google Drive ({time_str}).")
+                        logger.error(f"❌ [SCHEDULE] Скасовано відправку: локальна БД порожня або пошкоджена!")
 
             cutoff = (now_kyiv - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
             for key in list(executed_tasks.keys()):

@@ -4,6 +4,7 @@ api_config.py
 test.py
 
 # База даних та локальний стан
+stalzone_stats.db
 *.db
 *.db-shm
 *.db-wal
