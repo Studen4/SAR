@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from clan import render_clan_metrics_tab
 from drive_uploader import upload_db_to_drive, download_latest_db_from_drive
+from chat import render_chat_tab
 
 # Конфігурація API
 try:
@@ -675,6 +676,22 @@ class DatabaseManager:
             row = cursor.fetchone()
             return dict(row) if row else {}
 
+    def get_flexible_historical_snapshot(self, nickname: str, min_days: int, max_days: int) -> tuple[dict, int]:
+        """Шукає зріз '00:00' у діапазоні від min_days до max_days назад. Повертає (дані, кількість_днів_назад)."""
+        with self.get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            for d in range(min_days, max_days + 1):
+                target_date = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(days=d)).strftime('%Y-%m-%d')
+                cursor.execute("""
+                    SELECT * FROM daily_snapshots 
+                    WHERE nickname = ? AND snapshot_type = '00:00' AND DATE(timestamp) = ?
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (nickname, target_date))
+                row = cursor.fetchone()
+                if row:
+                    return dict(row), d
+        return {}, None
 
 # ==========================================
 # 4. АВТОМАТИЧНИЙ ФОНОВИЙ ПЛАНУВАЛЬНИК
@@ -691,6 +708,7 @@ def run_background_scheduler():
             minute = now_kyiv.minute
             weekday = now_kyiv.weekday()
 
+            # НС-СР (0, 1, 2, 6) кінок КВ о 22:00, ЧТ-СБ (3, 4, 5) кінець КВ о 22:15
             target_cw_hour, target_cw_min = (22, 0) if weekday in [6, 0, 1, 2] else (22, 15)
 
             db = DatabaseManager()
@@ -700,9 +718,9 @@ def run_background_scheduler():
             if sorted_groups:
                 api_client = StalzoneApiClient(API_CLIENT_ID, API_CLIENT_SECRET, "EU")
 
+                # Щоденний зріз о 00:00 (для загальної історії)
                 if hour == 0 and minute == 0 and (today_str, "00:00") not in executed_tasks:
                     logger.info("⏰ [SCHEDULE] Виконання щоденного зрізу 00:00 (збереження в історію)...")
-                    # db.clear_daily_data("00:00")  <-- ЦЕЙ РЯДОК ПОТРІБНО ВИДАЛИТИ/ЗАКОМЕНТУВАТИ
                     for g_name, g_nicks in sorted_groups:
                         for nick in g_nicks:
                             stats = api_client.fetch_player_stats(nick)
@@ -716,11 +734,9 @@ def run_background_scheduler():
                 if not cw_blocks and sorted_groups:
                     cw_blocks = [sorted_groups[0][0]]
 
-                # --- ПОЧАТОК НОВОГО КВ ЦИКЛУ (20:59 / 21:00) ---
-                if hour == 20 and minute == 59 and (today_str, "21:00") not in executed_tasks:
-                    logger.info(
-                        "⏰ [SCHEDULE] Запуск нового КВ циклу: очищення сьогоднішніх КВ зрізів і збір 21:00...")
-                    # Очищаємо зрізи ТІЛЬКИ ЗА СЬОГОДНІ, зберігаючи історію минулих днів
+                # --- ПОЧАТОК КВ ЦИКЛУ (20:59 / 21:00) ---
+                if hour == 21 and minute == 00 and (today_str, "21:00") not in executed_tasks:
+                    logger.info("⏰ [SCHEDULE] Запуск нового КВ циклу: очищення сьогоднішніх КВ зрізів і збір 21:00...")
                     db.clear_daily_data("21:00", only_today=True)
                     db.clear_daily_data("CW_END", only_today=True)
                     db.clear_daily_data("CUSTOM_START")
@@ -738,9 +754,10 @@ def run_background_scheduler():
                 target_cw_total_mins = target_cw_hour * 60 + target_cw_min - 1
                 curr_total_mins = hour * 60 + minute
 
-                # --- КІНЕЦЬ КВ ЦИКЛУ (CW_END) ---
+                # --- СУВОРО САТИСТИЧНИЙ КІНЕЦЬ КВ ЦИКЛУ (CW_END) ---
+                # Зберігається один раз у момент завершення КВ і більше ніколи не перезаписується
                 if curr_total_mins == target_cw_total_mins and (today_str, "CW_END") not in executed_tasks:
-                    logger.info(f"⏰ [SCHEDULE] Виконання зрізу CW_END (запуск о {hour}:{minute:02d})...")
+                    logger.info(f"⏰ [SCHEDULE] Фіксація стабільного зрізу CW_END о {hour}:{minute:02d}...")
                     db.clear_daily_data("CW_END", only_today=True)
                     for g_name in cw_blocks:
                         if g_name in groups:
@@ -749,39 +766,23 @@ def run_background_scheduler():
                                 if stats.get("status") == "OK":
                                     db.save_snapshot("CW_END", stats)
                     executed_tasks[(today_str, "CW_END")] = True
-                    logger.info("✅ [SCHEDULE] Зріз CW_END завершено. Статистика актуальна до наступного КВ.")
+                    logger.info("✅ [SCHEDULE] Зріз CW_END успішно зафіксовано та захищений від змін.")
 
-                # --- АВТОМАТИЧНИЙ ЗАПИС КВ В БД О 22:30 ТІЛЬКИ ДЛЯ АВТО-СКАНО ВАНИХ БЛОКІВ ---
-                if hour == 22 and minute == 30 and (today_str, "22:30_CW_SAVE") not in executed_tasks:
-                    logger.info("⏰ [SCHEDULE] Фіксування підсумкового зрізу КВ за день о 22:30...")
-                    for g_name in cw_blocks:
-                        if g_name in groups:
-                            for nick in groups[g_name]:
-                                stats = api_client.fetch_player_stats(nick)
-                                if stats.get("status") == "OK":
-                                    db.save_snapshot("CW_END", stats)
-                    executed_tasks[(today_str, "22:30_CW_SAVE")] = True
-                    logger.info("✅ [SCHEDULE] Підсумковий КВ запис у БД о 22:30 успішно збережено!")
-
-            # --- АВТОМАТИЧНЕ ЗБЕРЕЖЕННЯ ТА ПЕРЕДАЧА НА GOOGLE DRIVE О 23:00 ТА 00:30 ЗА КИЄВОМ ---
+            # --- АВТОМАТИЧНЕ ЗБЕРЕЖЕННЯ БАЗИ НА GOOGLE DRIVE О 23:00 ТА 00:30 ---
             if (hour == 23 and minute == 0) or (hour == 0 and minute == 30):
                 time_str = f"{hour:02d}:{minute:02d}"
                 task_key = f"{time_str}_DRIVE"
 
                 if (today_str, task_key) not in executed_tasks:
-                    logger.info(
-                        f"⏰ [SCHEDULE] Запуск автоматичного збереження та передачі БД на Google Drive ({time_str} Kyiv)...")
-                    # Запобіжник: відправляємо ТІЛЬКИ якщо в локальній БД є валідні записи
+                    logger.info(f"⏰ [SCHEDULE] Захищене збереження та передача БД на Google Drive ({time_str} Kyiv)...")
                     if get_db_max_timestamp("stalzone_stats.db"):
                         if upload_db_to_drive():
                             executed_tasks[(today_str, task_key)] = True
-                            logger.info(
-                                f"✅ [SCHEDULE] Резервну копію БД успішно відправлено на Google Drive ({time_str})!")
+                            logger.info(f"✅ [SCHEDULE] Резервну копію БД успішно відправлено на Google Drive ({time_str})!")
                         else:
-                            logger.error(
-                                f"❌ [SCHEDULE] Помилка відправки резервної копії БД на Google Drive ({time_str}).")
+                            logger.error(f"❌ [SCHEDULE] Помилка відправки резервної копії на Drive ({time_str}).")
                     else:
-                        logger.error(f"❌ [SCHEDULE] Скасовано відправку: локальна БД порожня або пошкоджена!")
+                        logger.error(f"❌ [SCHEDULE] Скасовано відправку: локальна БД порожня!")
 
             cutoff = (now_kyiv - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
             for key in list(executed_tasks.keys()):
@@ -792,7 +793,6 @@ def run_background_scheduler():
         except Exception as e:
             logger.error(f"❌ Помилка у фоновому планувальнику: {e}")
             time.sleep(30)
-
 
 @st.cache_resource
 def start_scheduler():
@@ -1351,13 +1351,15 @@ def main():
             "📋 До КВ (Основна статистика)",
             "⚔️ Після КВ \\ Зріз (Аналітика)",
             "🎴 Картка гравців",
-            "🛡️ Кланові метрики"
+            "🛡️ Кланові метрики",
+            "💬 Чат"
         ]
     else:
         main_menu_options = [
             "📋 Основна статистика",
             "⚔️ Зріз (аналітика)",
-            "🎴 Картка гравців"
+            "🎴 Картка гравців",
+            "💬 Чат"
         ]
 
     if hasattr(st, "segmented_control"):
@@ -1580,7 +1582,7 @@ def main():
         else:
             st.warning("Дані за обрану дату відсутні.")
 
-    # ---------------- РЕЖИМ 3: 🎴 КАРАТКА ГРАВЦІВ ----------------
+    # ---------------- РЕЖИМ 3: 🎴 КАРТКА ГРАВЦІВ ----------------
     elif mode == "🎴 Картка гравців":
         if not active_nicks:
             st.warning("⚠️ Оберіть конкретний блок гравців у лівому меню сайдбару!")
@@ -1640,7 +1642,7 @@ def main():
                 tp_val = 0.0
 
                 if tp_mode == "🔥 Загальний ТР (Total Power)":
-                    p_data = st.session_state.live_stats.get(nick, db.get_historical_snapshot(nick, 0))
+                    p_data = db.get_historical_snapshot(nick, 0)
                     if p_data:
                         tp_val = AnalyticsEngine.calc_tp(p_data)
                 else:
@@ -1684,24 +1686,25 @@ def main():
                 ]) if tier["players"] else "<i style='color: #777777;'>Немає гравців у цьому тирі</i>"
 
                 st.markdown(f"""
-                <div style="border-left: 6px solid {tier['color']}; background: #18191e; padding: 14px 18px; border-radius: 8px; margin-bottom: 14px;">
-                    <h4 style="margin: 0 0 10px 0; color: {tier['color']}; font-size: 1.1rem;">{tier['label']} &nbsp; <span style='font-size: 0.9rem; opacity: 0.8;'>(Гравців: {len(tier['players'])})</span></h4>
-                    <div>{player_badges}</div>
-                </div>
-                """, unsafe_allow_html=True)
+                    <div style="border-left: 6px solid {tier['color']}; background: #18191e; padding: 14px 18px; border-radius: 8px; margin-bottom: 14px;">
+                        <h4 style="margin: 0 0 10px 0; color: {tier['color']}; font-size: 1.1rem;">{tier['label']} &nbsp; <span style='font-size: 0.9rem; opacity: 0.8;'>(Гравців: {len(tier['players'])})</span></h4>
+                        <div>{player_badges}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-        # 👤 ПЕРСОНАЛЬНА КАРАТКА ГРАВЦЯ
+        # 👤 ПЕРСОНАЛЬНА КАРТКА ГРАВЦЯ
         with card_sub_mode[1]:
             st.subheader(f"🎴 Персональна картка аналітики")
 
-            selected_player = st.selectbox("Обрати гравця з блоку", sorted(active_nicks))
+            selected_player = st.selectbox("Обрати гравця з блоку", sorted(active_nicks),
+                                           key="pers_card_select")
 
             if selected_player:
-                curr_data = st.session_state.live_stats.get(selected_player,
-                                                            db.get_historical_snapshot(selected_player, 0))
+                # Актуальна статистика суворо з останнього зрізу за 00:00
+                curr_data = db.get_historical_snapshot(selected_player, 0)
 
                 if not curr_data:
-                    st.error("Для цього гравця відсутні дані в базі. Натисніть 'Отримати дані'.")
+                    st.error("Для цього гравця відсутні зрізи 00:00 у базі даних.")
                 else:
                     current_tp = AnalyticsEngine.calc_tp(curr_data)
 
@@ -1710,6 +1713,7 @@ def main():
                     A = curr_data.get("assists", 0)
                     DD = curr_data.get("damage_dealt", 0)
                     DR = max(curr_data.get("damage_recv", 0), 1)
+                    playtime = curr_data.get("playtime", 0)
 
                     HS = curr_data.get("headshots", 0)
                     BS = curr_data.get("bodyshots", 0)
@@ -1729,12 +1733,14 @@ def main():
                     c5.metric("🎯 % Влучань у голову", f"{curr_head_pct:.2f}%")
 
                     st.divider()
-                    st.markdown("### 📈 Динаміка змін (Було ➔ Стало)")
+                    st.markdown("### 📈 Динаміка змін (Історичні дані ➔ Актуальна)")
 
-                    def build_delta_col(title: str, days_ago: int):
-                        old_data = db.get_historical_snapshot(selected_player, days_ago)
+                    def build_dynamic_delta_col(title_prefix: str, min_d: int, max_d: int):
+                        old_data, found_days = db.get_flexible_historical_snapshot(selected_player, min_d,
+                                                                                   max_d)
                         if not old_data:
-                            st.caption(f"**{title}**: немає даних в БД")
+                            st.markdown(f"#### {title_prefix}")
+                            st.caption("Статистики поки немає")
                             return
 
                         old_tp = AnalyticsEngine.calc_tp(old_data)
@@ -1743,6 +1749,7 @@ def main():
                         old_A = old_data.get("assists", 0)
                         old_DD = old_data.get("damage_dealt", 0)
                         old_DR = max(old_data.get("damage_recv", 0), 1)
+                        old_playtime = old_data.get("playtime", 0)
 
                         old_HS = old_data.get("headshots", 0)
                         old_BS = old_data.get("bodyshots", 0)
@@ -1759,9 +1766,13 @@ def main():
                         kad_diff = round(kad - old_kad, 2)
                         un_up_diff = round(un_up - old_un_up, 2)
                         head_diff = round(curr_head_pct - old_head_pct, 2)
+                        time_diff = playtime - old_playtime
 
-                        st.markdown(f"#### {title}")
-                        st.metric("Зміна TP", f"{current_tp}", delta=f"{tp_diff:+}")
+                        target_date = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(
+                            days=found_days)).strftime('%Y-%m-%d')
+
+                        st.markdown(f"#### {title_prefix} ({target_date})")
+                        st.metric("Total Power (TP)", f"{old_tp}", delta=f"{tp_diff:+}")
 
                         st.markdown(f"**Кіли**: `{old_K}` ➔ `{K}` (`{K - old_K:+}`)")
                         st.markdown(f"**Смерті**: `{old_D}` ➔ `{D}` (`{D - old_D:+}`)")
@@ -1770,58 +1781,192 @@ def main():
                         st.metric("Зміна K/D", f"{old_kd} ➔ {kd}", delta=f"{kd_diff:+}")
                         st.metric("Зміна KAD", f"{old_kad} ➔ {kad}", delta=f"{kad_diff:+}")
 
-                        st.markdown(f"**Шкода**: `{int(old_DD):,}` / `{int(old_DR):,}` ➔ `{int(DD):,}` / `{int(DR):,}`")
+                        st.markdown(
+                            f"**Награний час**: `{old_playtime} хв.` ➔ `{playtime} хв.` (`{time_diff:+}` хв.)")
+                        st.markdown(
+                            f"**Шкода**: `{int(old_DD):,}` / `{int(old_DR):,}` ➔ `{int(DD):,}` / `{int(DR):,}`")
                         st.metric("Зміна УН/УП", f"{old_un_up} ➔ {un_up}", delta=f"{un_up_diff:+}")
-
                         st.metric("Зміна % Голови", f"{old_head_pct:.2f}% ➔ {curr_head_pct:.2f}%",
                                   delta=f"{head_diff:+.2f}%")
 
                     col_d1, col_d3, col_d7, col_d30 = st.columns(4)
                     with col_d1:
-                        build_delta_col("За 1 День", 1)
+                        st.markdown("#### Актуальна статистика")
+                        st.metric("Total Power", current_tp)
+                        st.markdown(f"**Кіли / Смерті**: `{K}` / `{D}`")
+                        st.markdown(f"**Награний час**: `{playtime} хв.`")
+                        st.markdown(f"**K/D / KAD**: `{kd}` / `{kad}`")
+                        st.markdown(f"**УН / УП**: `{un_up}`")
+                        st.markdown(f"**% Голови**: `{curr_head_pct:.2f}%`")
                     with col_d3:
-                        build_delta_col("За 3 Дні", 3)
+                        build_dynamic_delta_col("За 3 дні", 3, 7)
                     with col_d7:
-                        build_delta_col("За 7 Днів (Тиждень)", 7)
+                        build_dynamic_delta_col("За 7 днів", 7, 30)
                     with col_d30:
-                        build_delta_col("За 30 Днів (Місяць)", 30)
+                        build_dynamic_delta_col("За 30 днів", 30, 45)
+
+                    st.divider()
+                    st.markdown("### 📊 Графіки динаміки ТР (Останні 30 днів)")
+
+                    # Завжди отримуємо історію КВ на початку для уникнення помилок області видимості
+                    player_cw_hist = db.get_player_cw_history(selected_player)
+
+                    # Підготовка даних для діаграм через Plotly з динамічним зумом Y-осі
+                    try:
+                        import plotly.graph_objects as go
+
+                        # 1. Загальна динаміка ТР за останні 30 днів
+                        gen_dates, gen_tps = [], []
+                        for i in range(29, -1, -1):
+                            d_snap, _ = db.get_flexible_historical_snapshot(selected_player, i, i)
+                            if d_snap:
+                                target_date = (datetime.datetime.now(KYIV_TZ) - datetime.timedelta(
+                                    days=i)).strftime('%Y-%m-%d')
+                                gen_dates.append(target_date)
+                                gen_tps.append(AnalyticsEngine.calc_tp(d_snap))
+
+                        # Динамічний діапазон Y для загального графіку (зум під показники гравця)
+                        if gen_tps:
+                            min_tp = min(gen_tps)
+                            max_tp = max(gen_tps)
+                            pad = max(4.0, (max_tp - min_tp) * 0.8)
+                            y_range_gen = [max(0, min_tp - pad), min(300, max_tp + pad)]
+                        else:
+                            y_range_gen = [90, 160]
+
+                        fig_gen = go.Figure()
+                        fig_gen.add_hrect(y0=0, y1=100, fillcolor="rgba(255, 75, 75, 0.15)", layer="below",
+                                          line_width=0, annotation_text="Red Zone (<100)",
+                                          annotation_position="top left")
+                        fig_gen.add_hrect(y0=100, y1=150, fillcolor="rgba(0, 200, 83, 0.15)", layer="below",
+                                          line_width=0, annotation_text="Green Zone (100-150)",
+                                          annotation_position="top left")
+                        fig_gen.add_hrect(y0=150, y1=300, fillcolor="rgba(0, 229, 255, 0.15)", layer="below",
+                                          line_width=0, annotation_text="Cyan Zone (>150)",
+                                          annotation_position="top left")
+
+                        fig_gen.add_trace(go.Scatter(
+                            x=gen_dates, y=gen_tps,
+                            mode='lines+markers',
+                            name='Загальний TP',
+                            line=dict(color='#9D4EDD', width=3),
+                            marker=dict(size=8, color='#E0AAFF')
+                        ))
+                        fig_gen.update_layout(
+                            title="📈 Загальна динаміка ТР гравця",
+                            xaxis_title="Дата",
+                            yaxis_title="Total Power",
+                            yaxis=dict(range=y_range_gen),
+                            template="plotly_dark",
+                            margin=dict(l=20, r=20, t=40, b=20),
+                            height=300
+                        )
+                        st.plotly_chart(fig_gen, width='stretch')
+
+                        # 2. Динаміка ТР по КВ виступах
+                        valid_cw_hist = []
+                        for h in player_cw_hist:
+                            kills_val = int(h["cw_score"].split(" / ")[0])
+                            if h["slice_tp"] >= 10 and kills_val <= 150:
+                                valid_cw_hist.append(h)
+
+                        cw_dates_list = [h["date"] for h in player_cw_hist[::-1]]
+                        cw_tps_list = [h["slice_tp"] if (
+                                    h["slice_tp"] >= 10 and int(h["cw_score"].split(" / ")[0]) <= 150) else None
+                                       for h in player_cw_hist[::-1]]
+
+                        valid_cw_tps = [v for v in cw_tps_list if v is not None]
+                        if valid_cw_tps:
+                            min_cw_tp = min(valid_cw_tps)
+                            max_cw_tp = max(valid_cw_tps)
+                            pad_cw = max(6.0, (max_cw_tp - min_cw_tp) * 0.8)
+                            y_range_cw = [max(0, min_cw_tp - pad_cw), min(300, max_cw_tp + pad_cw)]
+                        else:
+                            y_range_cw = [90, 160]
+
+                        fig_cw = go.Figure()
+                        fig_cw.add_hrect(y0=0, y1=100, fillcolor="rgba(255, 75, 75, 0.15)", layer="below",
+                                         line_width=0)
+                        fig_cw.add_hrect(y0=100, y1=150, fillcolor="rgba(0, 200, 83, 0.15)", layer="below",
+                                         line_width=0)
+                        fig_cw.add_hrect(y0=150, y1=300, fillcolor="rgba(0, 229, 255, 0.15)", layer="below",
+                                         line_width=0)
+
+                        fig_cw.add_trace(go.Scatter(
+                            x=cw_dates_list, y=cw_tps_list,
+                            mode='lines+markers',
+                            connectgaps=True,
+                            name='ТР за КВ',
+                            line=dict(color='#00C853', width=3),
+                            marker=dict(size=8, color='#69F0AE')
+                        ))
+                        fig_cw.update_layout(
+                            title="⚔️ Динаміка ТР на КВ виступах",
+                            xaxis_title="Дата КВ",
+                            yaxis_title="Slice TP",
+                            yaxis=dict(range=y_range_cw),
+                            template="plotly_dark",
+                            margin=dict(l=20, r=20, t=40, b=20),
+                            height=300
+                        )
+                        st.plotly_chart(fig_cw, width='stretch')
+
+                    except ImportError:
+                        st.warning(
+                            "⚠️ Бібліотека Plotly не встановлена. Додайте `plotly` в `requirements.txt` та встановіть її командою: `pip install plotly`")
 
                     st.divider()
                     st.markdown("### ⚔️ Історія виступів гравця на КВ")
 
-                    player_cw_hist = db.get_player_cw_history(selected_player)
-
                     if not player_cw_hist:
                         st.info("ℹ️ Для цього гравця ще немає збережених записів КВ у базі.")
                     else:
-                        cw_count = len(player_cw_hist)
-                        avg_cw_tp = round(sum(h["slice_tp"] for h in player_cw_hist) / cw_count, 1)
-                        avg_cw_kd = round(sum(h["kd"] for h in player_cw_hist) / cw_count, 2)
-                        total_cw_kills = sum(int(h["cw_score"].split(" / ")[0]) for h in player_cw_hist)
-                        total_cw_deaths = sum(int(h["cw_score"].split(" / ")[1]) for h in player_cw_hist)
+                        valid_count = len(valid_cw_hist)
+                        if valid_count > 0:
+                            avg_cw_tp = round(sum(h["slice_tp"] for h in valid_cw_hist) / valid_count, 1)
+                            avg_cw_kd = round(sum(h["kd"] for h in valid_cw_hist) / valid_count, 2)
+                            total_cw_kills = sum(int(h["cw_score"].split(" / ")[0]) for h in valid_cw_hist)
+                            total_cw_deaths = sum(int(h["cw_score"].split(" / ")[1]) for h in valid_cw_hist)
+                        else:
+                            avg_cw_tp, avg_cw_kd, total_cw_kills, total_cw_deaths = 0.0, 0.0, 0, 0
 
                         mc1, mc2, mc3, mc4 = st.columns(4)
-                        mc1.metric("Зіграно КВ", f"{cw_count}")
+                        mc1.metric("Зіграно валідних КВ", f"{valid_count}")
                         mc2.metric("Сер. ТР на КВ", f"{avg_cw_tp}")
                         mc3.metric("Сер. K/D на КВ", f"{avg_cw_kd}")
                         mc4.metric("Настріл КВ (У/С)", f"{total_cw_kills} / {total_cw_deaths}")
 
-                        df_player_cw = pd.DataFrame([
-                            {
+                        table_rows = []
+                        for h in player_cw_hist:
+                            k_val = int(h["cw_score"].split(" / ")[0])
+                            is_skipped = (h["slice_tp"] < 10 or k_val > 150)
+                            table_rows.append({
+                                "Статус": "❌ Пропуск/Аномалія" if is_skipped else "✅ Успішно",
                                 "Дата КВ": h["date"],
-                                "ТР за КВ": h["slice_tp"],
+                                "ТР за КВ": round(h["slice_tp"], 1),
                                 "Настріл (У/С/П)": h["cw_score"],
-                                "У/С": h["kd"],
-                                "УП/С": h["kad"],
+                                "У/С": round(h["kd"], 2),
+                                "УП/С": round(h["kad"], 2),
                                 "Гранат": h["grenades"],
                                 "Шкода (УН/УП)": h["damage"],
-                                "УН/УП": h["un_up"],
+                                "УН/УП": round(h["un_up"], 2),
                                 "Точність": h["accuracy"]
-                            }
-                            for h in player_cw_hist
-                        ])
+                            })
 
-                        st.dataframe(df_player_cw, width='stretch', height=300)
+                        df_player_cw = pd.DataFrame(table_rows)
+
+                        def highlight_skipped_rows(row):
+                            if row["Статус"] == "❌ Пропуск/Аномалія":
+                                return ['background-color: rgba(255, 75, 75, 0.2); color: #ff9999'] * len(row)
+                            return [''] * len(row)
+
+                        styled_cw_df = (
+                            df_player_cw.style
+                            .format(
+                                {"ТР за КВ": "{:.1f}", "У/С": "{:.2f}", "УП/С": "{:.2f}", "УН/УП": "{:.2f}"})
+                            .apply(highlight_skipped_rows, axis=1)
+                        )
+                        st.dataframe(styled_cw_df, width='stretch', height=300)
 
     # ---------------- РЕЖИМ 4: 🛡️ КЛАНОВІ МЕТРИКИ (ТІЛЬКИ АДМІН) ----------------
     elif mode == "🛡️ Кланові метрики" and is_admin:
@@ -1835,6 +1980,8 @@ def main():
 
         render_clan_metrics_tab(db, selected_group, active_nicks)
 
+    elif mode == "💬 Чат":
+        render_chat_tab(db, username, is_admin)
 
 if __name__ == "__main__":
     main()

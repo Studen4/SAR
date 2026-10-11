@@ -1520,7 +1520,7 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
         st.markdown("---")
 
         year_val, month_val = months_map[selected_month_label]
-        _, days_in_month = calendar.monthrange(year_val, month_val)
+        start_weekday, days_in_month = calendar.monthrange(year_val, month_val)
 
         cols_per_row = 7
         days_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
@@ -1529,11 +1529,20 @@ def render_clan_metrics_tab(db, selected_group: str, active_nicks: list, engine=
         for idx, d_name in enumerate(days_names):
             h_cols[idx].markdown(f"**{d_name}**")
 
-        for day_num in range(1, days_in_month + 1):
-            if (day_num - 1) % cols_per_row == 0:
+        total_cells = start_weekday + days_in_month
+        for i in range(total_cells):
+            if i % cols_per_row == 0:
                 row_cols = st.columns(cols_per_row)
 
-            col_idx = (day_num - 1) % cols_per_row
+            col_idx = i % cols_per_row
+
+            if i < start_weekday:
+                with row_cols[col_idx]:
+                    with st.container(height=310, border=False):
+                        st.empty()
+                continue
+
+            day_num = i - start_weekday + 1
             date_str = f"{year_val:04d}-{month_val:02d}-{day_num:02d}"
             day_event = events_data.get(date_str, None)
 
