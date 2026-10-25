@@ -609,7 +609,7 @@ class DatabaseManager:
             else:
                 target_date = datetime.datetime.now(KYIV_TZ).strftime('%Y-%m-%d')
 
-            if snapshot_type in ("00:00", "20:00", "CW_END"):
+            if snapshot_type in ("00:00", "21:00", "CW_END"):
                 # Видаляємо перезапис ТІЛЬКИ ЗА ТОЙ ЖЕ ДЕНЬ для збереження історії минулих днів
                 cursor.execute("""
                     DELETE FROM daily_snapshots 
@@ -652,7 +652,7 @@ class DatabaseManager:
             cursor.execute("""
                 SELECT DISTINCT DATE(timestamp) as cw_date 
                 FROM daily_snapshots 
-                WHERE snapshot_type IN ('20:00', 'CW_END')
+                WHERE snapshot_type IN ('21:00', 'CW_END')
                 ORDER BY cw_date DESC
             """)
             rows = cursor.fetchall()
@@ -675,7 +675,7 @@ class DatabaseManager:
         dates = self.get_cw_dates()
         history = []
         for d in dates:
-            snap_start = self.get_snapshot_by_date("20:00", d)
+            snap_start = self.get_snapshot_by_date("21:00", d)
             snap_end = self.get_snapshot_by_date("CW_END", d)
 
             start = snap_start.get(nickname)
@@ -745,8 +745,8 @@ def run_background_scheduler():
             minute = now_kyiv.minute
             weekday = now_kyiv.weekday()
 
-            # НС-СР (0, 1, 2, 6) кінок КВ о 22:00, ЧТ-СБ (3, 4, 5) кінець КВ о 22:15
-            target_cw_hour, target_cw_min = (22, 0) if weekday in [6, 0, 1, 2] else (22, 15)
+            # НС-СР (0, 1, 2, 6) кінець КВ о 21:00, ЧТ-СБ (3, 4, 5) кінець КВ о 21:15
+            target_cw_hour, target_cw_min = (21, 0) if weekday in [6, 0, 1, 2] else (21, 15)
 
             db = DatabaseManager()
             groups = db.get_global_groups()
@@ -771,10 +771,10 @@ def run_background_scheduler():
                 if not cw_blocks and sorted_groups:
                     cw_blocks = [sorted_groups[0][0]]
 
-                # --- ПОЧАТОК КВ ЦИКЛУ (20:00) ---
-                if hour == 20 and minute == 00 and (today_str, "20:00") not in executed_tasks:
-                    logger.info("⏰ [SCHEDULE] Запуск нового КВ циклу: очищення сьогоднішніх КВ зрізів і збір 20:00...")
-                    db.clear_daily_data("20:00", only_today=True)
+                # --- ПОЧАТОК КВ ЦИКЛУ (О 20:00 замість 21:00, але зберігаємо в БД як "21:00" для сумісності) ---
+                if hour == 20 and minute == 00 and (today_str, "21:00") not in executed_tasks:
+                    logger.info("⏰ [SCHEDULE] Запуск нового КВ циклу о 20:00: очищення сьогоднішніх зрізів і збір...")
+                    db.clear_daily_data("21:00", only_today=True)
                     db.clear_daily_data("CW_END", only_today=True)
                     db.clear_daily_data("CUSTOM_START")
                     db.clear_daily_data("CUSTOM_END")
@@ -784,9 +784,9 @@ def run_background_scheduler():
                             for nick in groups[g_name]:
                                 stats = api_client.fetch_player_stats(nick)
                                 if stats.get("status") == "OK":
-                                    db.save_snapshot("20:00", stats)
-                    executed_tasks[(today_str, "20:00")] = True
-                    logger.info("✅ [SCHEDULE] Новий зріз 20:00 успішно збережено!")
+                                    db.save_snapshot("21:00", stats)
+                    executed_tasks[(today_str, "21:00")] = True
+                    logger.info("✅ [SCHEDULE] Зріз КВ успішно зібрано о 20:00 та зафіксовано в БД!")
 
                 target_cw_total_mins = target_cw_hour * 60 + target_cw_min - 1
                 curr_total_mins = hour * 60 + minute
@@ -969,7 +969,7 @@ class AnalyticsEngine:
         snap_custom_end = db.get_snapshot("CUSTOM_END")
 
         snap_00 = db.get_snapshot("00:00")
-        snap_21 = db.get_snapshot("20:00")
+        snap_21 = db.get_snapshot("21:00")
         snap_cw = db.get_snapshot("CW_END")
 
         use_custom = bool(snap_custom_start and snap_custom_end)
@@ -1161,7 +1161,7 @@ def main():
             with st.expander("🛠️ Тестові кнопки замірів (Debug)", expanded=False):
                 st.caption("Керування зрізами в БД для ручної перевірки обчислень.")
 
-                st.markdown("**⚔️ Сканування КВ (20:00 / CW_END):**")
+                st.markdown("**⚔️ Сканування КВ (21:00 / CW_END):**")
                 all_global_groups = db.get_global_groups()
                 sorted_g_names = [g[0] for g in
                                   sorted(all_global_groups.items(), key=lambda x: len(x[1]), reverse=True)]
@@ -1256,13 +1256,13 @@ def main():
                     elif not st.session_state.live_stats:
                         st.warning("Спочатку отримайте дані через 'Отримати дані'!")
                     else:
-                        # Отримуємо актуальний зріз 20:00 з бази даних перед перевіркою
-                        snap_21 = db.get_snapshot("20:00")
+                        # Отримуємо актуальний зріз 21:00 з бази даних перед перевіркою
+                        snap_21 = db.get_snapshot("21:00")
 
                         if not snap_21:
                             for nick in active_nicks:
                                 if nick in st.session_state.live_stats:
-                                    db.save_snapshot("20:00", st.session_state.live_stats[nick])
+                                    db.save_snapshot("21:00", st.session_state.live_stats[nick])
                         for nick in active_nicks:
                             if nick in st.session_state.live_stats:
                                 db.save_snapshot("CW_END", st.session_state.live_stats[nick])
@@ -1285,14 +1285,14 @@ def main():
                         time.sleep(1)
                         st.rerun()
 
-                if st.button("📸 Записати 20:00 (Новий КВ цикл)", width='stretch'):
+                if st.button("📸 Записати 21:00 (Новий КВ цикл)", width='stretch'):
                     if not active_nicks:
                         st.error("Оберіть блок гравців у списку вище!")
                     elif not st.session_state.live_stats:
                         st.warning("Спочатку отримайте дані!")
                     else:
-                        # Початок нового КВ циклу: очищаємо старий 20:00 та старий CW_END
-                        db.clear_daily_data("20:00")
+                        # Початок нового КВ циклу: очищаємо старий 21:00 та старий CW_END
+                        db.clear_daily_data("21:00")
                         db.clear_daily_data("CW_END")
                         db.clear_daily_data("CUSTOM_START")
                         db.clear_daily_data("CUSTOM_END")
@@ -1300,8 +1300,8 @@ def main():
                         st.session_state.custom_end = {}
                         for nick in active_nicks:
                             if nick in st.session_state.live_stats:
-                                db.save_snapshot("20:00", st.session_state.live_stats[nick])
-                        st.success("✅ Зріз 20:00 збережено! Новий КВ цикл розпочато.")
+                                db.save_snapshot("21:00", st.session_state.live_stats[nick])
+                        st.success("✅ Зріз 21:00 збережено! Новий КВ цикл розпочато.")
                         time.sleep(1)
                         st.rerun()
 
@@ -1436,7 +1436,7 @@ def main():
             st.rerun()
 
     snap_00 = db.get_snapshot("00:00")
-    snap_21 = db.get_snapshot("20:00")
+    snap_21 = db.get_snapshot("21:00")
     snap_cw = db.get_snapshot("CW_END")
 
     st.divider()
@@ -1521,7 +1521,7 @@ def main():
 
         # Фіксуємо вибірку актуальних зрізів СУВОРО за поточний день
         today_str = datetime.datetime.now(KYIV_TZ).strftime('%Y-%m-%d')
-        snap_21_today = db.get_snapshot_by_date("20:00", today_str)
+        snap_21_today = db.get_snapshot_by_date("21:00", today_str)
         snap_cw_today = db.get_snapshot_by_date("CW_END", today_str)
 
         if selected_cw_date == "Актуальні значення":
@@ -1532,7 +1532,7 @@ def main():
                 with col_choice:
                     analytics_source = st.radio(
                         "Джерело аналітики:",
-                        options=["⏱️ Ручний зріз", "⚔️ Стандартний КВ (20:00 -> КВ)"],
+                        options=["⏱️ Ручний зріз", "⚔️ Стандартний КВ (21:00 -> КВ)"],
                         horizontal=True
                     )
             elif is_tracking_active:
@@ -1540,14 +1540,14 @@ def main():
             else:
                 if not snap_21_today:
                     st.warning(
-                        "⏳ **Зріз 20:00 ще не зафіксовано в базі.** Аналітика КВ буде доступна після 20:00 (або після збереження зрізу 20:00).")
+                        "⏳ **Зріз 21:00 ще не зафіксовано в базі.** Аналітика КВ буде доступна після 21:00 (або після збереження зрізу 21:00).")
                 else:
                     st.info("⚔️ Відображається актуальна статистика КВ за сьогодні.")
 
             target_nicks = active_nicks
         else:
             st.success(f"📅 Перегляд збереженого архіву КВ за дату: **{selected_cw_date}**")
-            snap_21_hist = db.get_snapshot_by_date("20:00", selected_cw_date)
+            snap_21_hist = db.get_snapshot_by_date("21:00", selected_cw_date)
             snap_cw_hist = db.get_snapshot_by_date("CW_END", selected_cw_date)
 
             # Витягуємо безпосередньо гравців із цього історичного зрізу
@@ -1574,7 +1574,7 @@ def main():
                 end = snap_cw_hist.get(nick, {})
 
             if not start or not end:
-                status_text = "Очікування 20:00" if not start else "Очікування кінця КВ"
+                status_text = "Очікування 21:00" if not start else "Очікування кінця КВ"
                 rows.append({
                     "Нік": nick,
                     "ТР за період": 0.0,
