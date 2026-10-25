@@ -234,20 +234,24 @@ def render_chat_tab(db, username: str, is_admin: bool):
                 is_me = (sender == username)
                 bg_color = "#2D143A" if is_me else "#1E1E24"
 
-                c_msg, c_del = st.columns([0.92, 0.08] if is_admin else [1, 0])
-                with c_msg:
-                    st.markdown(f"""
-                        <div style="background-color: {bg_color}; border-radius: 8px; padding: 10px; margin-bottom: 8px; border: 1px solid #9D4EDD;">
-                            <small style="color: #E0AAFF; font-weight: bold;">{sender} <span style="font-weight: normal; color: #888; font-size: 0.8em;">({t_stamp})</span></small>
-                            <div style="color: #FFF; margin-top: 4px; word-break: break-word;">{text}</div>
-                            {f'<div style="margin-top: 6px;"><a href="{f_url}" target="_blank" style="color: #00E5FF;">📎 Переглянути файл / зображення</a></div>' if f_url else ''}
-                        </div>
-                    """, unsafe_allow_html=True)
+                msg_html = f"""
+                                    <div style="background-color: {bg_color}; border-radius: 8px; padding: 10px; margin-bottom: 8px; border: 1px solid #9D4EDD;">
+                                        <small style="color: #E0AAFF; font-weight: bold;">{sender} <span style="font-weight: normal; color: #888; font-size: 0.8em;">({t_stamp})</span></small>
+                                        <div style="color: #FFF; margin-top: 4px; word-break: break-word;">{text}</div>
+                                        {f'<div style="margin-top: 6px;"><a href="{f_url}" target="_blank" style="color: #00E5FF;">📎 Переглянути файл / зображення</a></div>' if f_url else ''}
+                                    </div>
+                                """
+
                 if is_admin:
+                    c_msg, c_del = st.columns([0.92, 0.08])
+                    with c_msg:
+                        st.markdown(msg_html, unsafe_allow_html=True)
                     with c_del:
                         if st.button("🗑️", key=f"del_{msg_id}", help="Видалити повідомлення"):
                             st.query_params["delete_msg"] = str(msg_id)
                             st.rerun()
+                else:
+                    st.markdown(msg_html, unsafe_allow_html=True)
 
         with st.form(key="chat_input_form", clear_on_submit=True):
             col_inp, col_clip, col_send = st.columns([0.80, 0.10, 0.10], vertical_alignment="bottom")

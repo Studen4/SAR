@@ -280,12 +280,38 @@ class StalzoneApiClient:
                 }
                 global_api_cache.set(nickname, self.region, result)
                 return result
+            elif res.status_code == 404:
+                # Повертаємо спеціальний статус для реального 404 (неіснуючий нікнейм)
+                return {"status": "Not_Found", **empty_stats}
             else:
                 logger.error(f"⚠️ Помилка отримання профілю {nickname}: HTTP {res.status_code}")
-                return empty_stats
+                return {"status": f"HTTP_{res.status_code}", **empty_stats}
         except Exception as e:
             logger.error(f"❌ Мережева помилка для {nickname}: {e}")
-            return empty_stats
+            return {"status": "Exception", **empty_stats}
+
+    def fetch_player_stats_with_retry(self, nickname: str, max_retries: int = 4, delay: int = 4) -> dict:
+        """Нова функція: реалізує повторні спроби для обробки помилок 500 та 525."""
+        res = self.fetch_player_stats(nickname)
+        if res.get("status") in ["OK", "Not_Found"]:
+            return res
+
+        # Повторні спроби у разі тимчасових збоїв сервера
+        for attempt in range(1, max_retries + 1):
+            time.sleep(delay)
+            logger.info(f"🔄 Повторна спроба {attempt}/{max_retries} для гравця '{nickname}' через збій сервера...")
+            res = self.fetch_player_stats(nickname)
+            if res.get("status") in ["OK", "Not_Found"]:
+                return res
+
+        # Якщо після всіх спроб сервер не відповів, повертаємо стандартні нулі зі статусом Error
+        empty_stats = {
+            "nickname": nickname, "status": "Error",
+            "kills": 0, "assists": 0, "deaths": 0, "playtime": 0,
+            "damage_dealt": 0, "damage_recv": 0, "grenades": 0,
+            "headshots": 0, "bodyshots": 0, "limbshots": 0
+        }
+        return empty_stats
 
     def fetch_clan_members_by_player(self, nickname: str) -> tuple[str, list]:
         if not self._authenticate():
@@ -372,28 +398,31 @@ class StalzoneApiClient:
             return {}
 
         results = {}
+        failed_nicks = []
         total_count = len(nicknames)
         completed_count = 0
         workers = min(max(1, batch_size), len(nicknames))
 
+        # ПРОХІД 1: Паралельне сканування всього списку
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_nick = {executor.submit(self.fetch_player_stats, nick): nick for nick in nicknames}
 
             for future in as_completed(future_to_nick):
                 nick = future_to_nick[future]
+                completed_count += 1
                 try:
                     stats = future.result()
-                    results[nick] = stats
+                    status = stats.get("status")
+                    if status in ["OK", "Not_Found"]:
+                        if status == "Not_Found":
+                            stats["status"] = "Error"  # Приводимо до стандартного формату для неіснуючих
+                        results[nick] = stats
+                    else:
+                        # Серверні помилки (500, 525 тощо) додаємо в чергу на другий прохід
+                        failed_nicks.append(nick)
                 except Exception as e:
                     logger.error(f"❌ Помилка отримання статистики для {nick}: {e}", exc_info=True)
-                    results[nick] = {
-                        "nickname": nick, "status": "Error",
-                        "kills": 0, "assists": 0, "deaths": 0, "playtime": 0,
-                        "damage_dealt": 0, "damage_recv": 0, "grenades": 0,
-                        "headshots": 0, "bodyshots": 0, "limbshots": 0
-                    }
-
-                completed_count += 1
+                    failed_nicks.append(nick)
 
                 if progress_callback:
                     try:
@@ -401,8 +430,16 @@ class StalzoneApiClient:
                     except Exception as cb_err:
                         logger.error(f"⚠️ Помилка виклику progress_callback для {nick}: {cb_err}")
 
-        return results
+        # ПРОХІД 2: Повторні спроби для гравців, чиї запити впали через помилки сервера
+        if failed_nicks:
+            logger.info(f"🔄 Запуск повторних спроб для {len(failed_nicks)} гравців зі збоями сервера...")
+            for nick in failed_nicks:
+                stats = self.fetch_player_stats_with_retry(nick, max_retries=4, delay=4)
+                if stats.get("status") == "Not_Found":
+                    stats["status"] = "Error"
+                results[nick] = stats
 
+        return results
 
 # ==========================================
 # 3. МЕНЕДЖЕР БД (SQLite)
