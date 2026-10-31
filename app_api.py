@@ -290,21 +290,29 @@ class StalzoneApiClient:
             logger.error(f"❌ Мережева помилка для {nickname}: {e}")
             return {"status": "Exception", **empty_stats}
 
-    def fetch_player_stats_with_retry(self, nickname: str, max_retries: int = 4, delay: int = 4) -> dict:
-        """Нова функція: реалізує повторні спроби для обробки помилок 500 та 525."""
+    def fetch_player_stats_with_retry(self, nickname: str, max_retries: int = 4) -> dict:
+        """Реалізує повторні спроби з експоненціальною затримкою для обробки 500 та 525."""
         res = self.fetch_player_stats(nickname)
         if res.get("status") in ["OK", "Not_Found"]:
             return res
 
-        # Повторні спроби у разі тимчасових збоїв сервера
+        # Динамічні паузи між спробами: 2с, 5с, 9с, 14с
+        delays = [2, 5, 9, 14]
+
         for attempt in range(1, max_retries + 1):
-            time.sleep(delay)
-            logger.info(f"🔄 Повторна спроба {attempt}/{max_retries} для гравця '{nickname}' через збій сервера...")
+            sleep_time = delays[attempt - 1] if attempt <= len(delays) else 10
+            time.sleep(sleep_time)
+
+            logger.info(
+                f"🔄 Повторна спроба {attempt}/{max_retries} для '{nickname}' через {sleep_time}с (код: {res.get('status')})...")
             res = self.fetch_player_stats(nickname)
+
             if res.get("status") in ["OK", "Not_Found"]:
+                logger.info(f"✅ [RETRY SUCCESS] Дані для '{nickname}' успішно отримано на спробі №{attempt}!")
                 return res
 
-        # Якщо після всіх спроб сервер не відповів, повертаємо стандартні нулі зі статусом Error
+        logger.error(
+            f"❌ [RETRY FAILED] Усі {max_retries} спроби для '{nickname}' вичерпано. Статус: {res.get('status')}")
         empty_stats = {
             "nickname": nickname, "status": "Error",
             "kills": 0, "assists": 0, "deaths": 0, "playtime": 0,
@@ -393,7 +401,8 @@ class StalzoneApiClient:
             logger.error(f"❌ Помилка отримання складу клану: {e}")
             return None, []
 
-    def fetch_bulk_player_stats(self, nicknames: list, batch_size: int = 10, progress_callback=None) -> dict:
+    def fetch_bulk_player_stats(self, nicknames: list, batch_size: int = 5, progress_callback=None) -> dict:
+        """Сканування з м'яким обмеженням потоків (batch_size=4) та мікро-затримкою."""
         if not nicknames:
             return {}
 
@@ -401,11 +410,18 @@ class StalzoneApiClient:
         failed_nicks = []
         total_count = len(nicknames)
         completed_count = 0
+
+        # Обмежуємо кількість одночасних потоків до 4 (замість 10)
         workers = min(max(1, batch_size), len(nicknames))
 
-        # ПРОХІД 1: Паралельне сканування всього списку
+        def worker_task(nick):
+            # Мікро-пауза для згладжування імпульсного навантаження на Cloudflare
+            time.sleep(0.03)
+            return self.fetch_player_stats(nick)
+
+        # ПРОХІД 1: Паралельне сканування з м'яким розміром пулу
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_nick = {executor.submit(self.fetch_player_stats, nick): nick for nick in nicknames}
+            future_to_nick = {executor.submit(worker_task, nick): nick for nick in nicknames}
 
             for future in as_completed(future_to_nick):
                 nick = future_to_nick[future]
@@ -415,10 +431,9 @@ class StalzoneApiClient:
                     status = stats.get("status")
                     if status in ["OK", "Not_Found"]:
                         if status == "Not_Found":
-                            stats["status"] = "Error"  # Приводимо до стандартного формату для неіснуючих
+                            stats["status"] = "Error"
                         results[nick] = stats
                     else:
-                        # Серверні помилки (500, 525 тощо) додаємо в чергу на другий прохід
                         failed_nicks.append(nick)
                 except Exception as e:
                     logger.error(f"❌ Помилка отримання статистики для {nick}: {e}", exc_info=True)
@@ -430,11 +445,11 @@ class StalzoneApiClient:
                     except Exception as cb_err:
                         logger.error(f"⚠️ Помилка виклику progress_callback для {nick}: {cb_err}")
 
-        # ПРОХІД 2: Повторні спроби для гравців, чиї запити впали через помилки сервера
+        # ПРОХІД 2: Повторні спроби для гравців із помилками
         if failed_nicks:
             logger.info(f"🔄 Запуск повторних спроб для {len(failed_nicks)} гравців зі збоями сервера...")
             for nick in failed_nicks:
-                stats = self.fetch_player_stats_with_retry(nick, max_retries=4, delay=4)
+                stats = self.fetch_player_stats_with_retry(nick, max_retries=4)
                 if stats.get("status") == "Not_Found":
                     stats["status"] = "Error"
                 results[nick] = stats
@@ -791,19 +806,38 @@ def run_background_scheduler():
                 target_cw_total_mins = target_cw_hour * 60 + target_cw_min - 1
                 curr_total_mins = hour * 60 + minute
 
-                # --- СУВОРО САТИСТИЧНИЙ КІНЕЦЬ КВ ЦИКЛУ (CW_END) ---
-                # Зберігається один раз у момент завершення КВ і більше ніколи не перезаписується
-                if curr_total_mins == target_cw_total_mins and (today_str, "CW_END") not in executed_tasks:
+                # --- СУВОРО СТАТИСТИЧНИЙ КІНЕЦЬ КВ ЦИКЛУ (CW_END) ---
+                snap_cw_exist = db.get_snapshot_by_date("CW_END", today_str)
+                if curr_total_mins >= target_cw_total_mins and hour < 23 and not snap_cw_exist and (today_str,
+                                                                                                    "CW_END") not in executed_tasks:
                     logger.info(f"⏰ [SCHEDULE] Фіксація стабільного зрізу CW_END о {hour}:{minute:02d}...")
                     db.clear_daily_data("CW_END", only_today=True)
+
+                    cw_nicks = []
                     for g_name in cw_blocks:
                         if g_name in groups:
-                            for nick in groups[g_name]:
-                                stats = api_client.fetch_player_stats(nick)
-                                if stats.get("status") == "OK":
-                                    db.save_snapshot("CW_END", stats)
+                            cw_nicks.extend(groups[g_name])
+                    cw_nicks = list(dict.fromkeys(cw_nicks))
+
+                    # Використовуємо пакетне сканування з авто-ретраями (Pass 1 + Pass 2)
+                    bulk_results = api_client.fetch_bulk_player_stats(cw_nicks, batch_size=5)
+                    saved_count = 0
+                    failed_nicks = []
+
+                    for nick, stats in bulk_results.items():
+                        if stats.get("status") == "OK":
+                            db.save_snapshot("CW_END", stats)
+                            saved_count += 1
+                        else:
+                            failed_nicks.append(nick)
+
                     executed_tasks[(today_str, "CW_END")] = True
-                    logger.info("✅ [SCHEDULE] Зріз CW_END успішно зафіксовано та захищений від змін.")
+                    if failed_nicks:
+                        logger.warning(
+                            f"⚠️ [SCHEDULE] Зріз CW_END збережено частково ({saved_count}/{len(cw_nicks)}). Не вдалося завантажити: {failed_nicks}")
+                    else:
+                        logger.info(
+                            f"✅ [SCHEDULE] Зріз CW_END успішно зафіксовано в БД для всіх {saved_count}/{len(cw_nicks)} гравців!")
 
             # --- АВТОМАТИЧНЕ ЗБЕРЕЖЕННЯ БАЗИ НА GOOGLE DRIVE О 23:00 ТА 00:30 ---
             if (hour == 23 and minute == 0) or (hour == 0 and minute == 30):
@@ -1424,7 +1458,7 @@ def main():
 
             results = api_client.fetch_bulk_player_stats(
                 active_nicks,
-                batch_size=10,
+                batch_size=5,
                 progress_callback=update_progress
             )
             st.session_state.live_stats.update(results)
@@ -1496,7 +1530,7 @@ def main():
         df_pre = pd.DataFrame(act_rows)
         st.dataframe(df_pre, width='stretch', height=450)
 
-        # ---------------- РЕЖИМ 2: ЗРІЗ (АНАЛІТИКА) ----------------
+    # ---------------- РЕЖИМ 2: ЗРІЗ (АНАЛІТИКА) ----------------
     elif mode in ["⚔️ Після КВ \\ Зріз (Аналітика)", "⚔️ Зріз (аналітика)"]:
         if not active_nicks and "selected_cw_date" not in st.session_state:
             st.info("👈 Оберіть або створіть блок гравців у панелі ліворуч.")
@@ -1618,6 +1652,177 @@ def main():
             st.dataframe(styled_df, width='stretch', height=450)
         else:
             st.warning("Дані за обрану дату відсутні.")
+
+        # ---------------- 📊 ЄДИНА АНАЛІТИЧНА ДІАГРАМА ОТРЯДІВ (ТІЛЬКИ АДМІН) ----------------
+        if is_admin and not df_post.empty:
+            st.divider()
+            st.markdown("### 📊 Порівняльна накопичувальна аналітика отрядів за КВ")
+
+            # 1. Створюємо словник ТР тільки для тих гравців, у яких ТР за КВ > 0.0
+            player_tp_map = {}
+            for r in rows:
+                p_nick = r.get("Нік")
+                p_tp = r.get("ТР за період", 0.0)
+                try:
+                    val = float(p_tp)
+                    if val > 0.0:
+                        player_tp_map[p_nick] = val
+                except (ValueError, TypeError):
+                    pass
+
+            # 2. Зчитуємо склад отрядів (де номер > 0) та їх назви з БД
+            squad_players_map = {}
+            squad_titles_map = {}
+
+            try:
+                with db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='player_equip'")
+                    if cursor.fetchone():
+                        cursor.execute("""
+                            SELECT nickname, otryad_num FROM player_equip 
+                            WHERE (group_name = ? OR group_name = '' OR group_name IS NULL) AND otryad_num > 0
+                        """, (selected_group,))
+                        for p_nick, o_num in cursor.fetchall():
+                            # Додаємо ТІЛЬКИ діючих гравців із позитивним ТР за дане КВ
+                            if p_nick in player_tp_map:
+                                if o_num not in squad_players_map:
+                                    squad_players_map[o_num] = []
+                                squad_players_map[o_num].append(p_nick)
+
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='squad_titles'")
+                    if cursor.fetchone():
+                        cursor.execute("SELECT otryad_num, title FROM squad_titles WHERE group_name = ?",
+                                       (selected_group,))
+                        squad_titles_map = dict(cursor.fetchall())
+            except Exception as e:
+                logger.error(f"Помилка зчитування отрядів з БД: {e}")
+
+            if not squad_players_map:
+                st.info("ℹ️ Не знайдено активних гравців із ТР > 0 у сформованих отрядах для цього зрізу.")
+            else:
+                import plotly.graph_objects as go
+
+                # Палітра яскравих кольорів для ліній різних отрядів
+                COLOR_PALETTE = [
+                    "#00E5FF",  # Яскраво-блакитний
+                    "#FFD700",  # Золотий
+                    "#FF4D6D",  # Коралово-червоний
+                    "#00C853",  # Зелений
+                    "#E0AAFF",  # Бузковий
+                    "#FF9E00",  # Помаранчевий
+                    "#00F5D4",  # М'ятний
+                    "#7000FF"  # Фіолетовий
+                ]
+
+                fig = go.Figure()
+
+                sorted_squad_nums = sorted(squad_players_map.keys())
+
+                # Обчислюємо максимальну кількість гравців серед усіх отрядів для налаштування X-осі
+                max_players_count = max(
+                    len(squad_players_map[o]) for o in sorted_squad_nums) if sorted_squad_nums else 5
+                global_end_x = max(max_players_count + 3, 8)
+                max_squad_tp_all = 0.0
+
+                # Наносимо кожен отряд окремою кольоровою лінією на один графік
+                for squad_idx, o_num in enumerate(sorted_squad_nums):
+                    members = squad_players_map[o_num]
+                    s_title = squad_titles_map.get(o_num, f"Отряд {o_num}")
+
+                    # Отримуємо пару (Нік, ТР) тільки для гравців з ТР > 0
+                    squad_p_data = [(m_nick, player_tp_map[m_nick]) for m_nick in members if m_nick in player_tp_map]
+
+                    if not squad_p_data:
+                        continue
+
+                    squad_color = COLOR_PALETTE[squad_idx % len(COLOR_PALETTE)]
+                    best_nick, best_tp = max(squad_p_data, key=lambda x: x[1])
+
+                    # Накопичувальні показники
+                    x_vals = [0]
+                    y_vals = [0.0]
+                    hover_texts = [f"<b>{s_title}</b>: Старт (0 TP)"]
+
+                    cum_tp = 0.0
+                    for p_idx, (p_nick, p_tp) in enumerate(squad_p_data, 1):
+                        cum_tp += p_tp
+                        x_vals.append(p_idx)
+                        y_vals.append(round(cum_tp, 1))
+                        hover_texts.append(
+                            f"<b>{s_title}</b><br>"
+                            f"<b>Гравець #{p_idx}:</b> {p_nick}<br>"
+                            f"<b>ТР за КВ:</b> {p_tp}<br>"
+                            f"<b>Накопичено:</b> {round(cum_tp, 1)} TP"
+                        )
+
+                    total_squad_tp = round(cum_tp, 1)
+                    if total_squad_tp > max_squad_tp_all:
+                        max_squad_tp_all = total_squad_tp
+
+                    # Продовжуємо лінію до загального кінця для рівного зчитування рівня
+                    n_players = len(squad_p_data)
+                    x_vals.append(global_end_x)
+                    y_vals.append(total_squad_tp)
+                    hover_texts.append(f"<b>{s_title} (Загальний рівень):</b> {total_squad_tp} TP")
+
+                    # Додаємо лінію отряду
+                    fig.add_trace(go.Scatter(
+                        x=x_vals,
+                        y=y_vals,
+                        mode='lines+markers',
+                        name=f"#{o_num} {s_title}",
+                        line=dict(color=squad_color, width=3),
+                        marker=dict(size=8, color=squad_color),
+                        hovertext=hover_texts,
+                        hoverinfo='text'
+                    ))
+
+                    # Текстовий підпис над кінцевою лінією відповідним кольором
+                    annot_text = f"Squad #{o_num} ({s_title}) (total: {total_squad_tp} TP) \\ Best: {best_nick} ({best_tp} TP)"
+                    fig.add_annotation(
+                        x=n_players + 0.1,
+                        y=total_squad_tp,
+                        text=f"<b>{annot_text}</b>",
+                        showarrow=False,
+                        yshift=10,
+                        xanchor='left',
+                        font=dict(size=11, color=squad_color)
+                    )
+
+                # Фонові кольорові зони
+                max_y = max(1000, max_squad_tp_all + 150)
+                fig.add_hrect(y0=0, y1=500, fillcolor="rgba(255, 75, 75, 0.2)", layer="below", line_width=0)
+                fig.add_hrect(y0=500, y1=750, fillcolor="rgba(0, 200, 83, 0.2)", layer="below", line_width=0)
+                fig.add_hrect(y0=750, y1=max_y, fillcolor="rgba(0, 229, 255, 0.2)", layer="below", line_width=0)
+
+                fig.update_layout(
+                    title="⚔️ Накопичувальний ТР всіх отрядів за КВ",
+                    xaxis=dict(
+                        title="Гравці отряду",
+                        tickmode='array',
+                        tickvals=list(range(1, max_players_count + 1)),
+                        ticktext=[str(i) for i in range(1, max_players_count + 1)],
+                        range=[0, global_end_x + 0.5]
+                    ),
+                    yaxis=dict(
+                        title="Total Power (TP)",
+                        range=[0, max_y]
+                    ),
+                    template="plotly_dark",
+                    margin=dict(l=40, r=40, t=50, b=40),
+                    height=500,
+                    showlegend=True,
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="right",
+                        x=1
+                    )
+                )
+
+                st.plotly_chart(fig, width='stretch')
 
     # ---------------- РЕЖИМ 3: 🎴 КАРТКА ГРАВЦІВ ----------------
     elif mode == "🎴 Картка гравців":
